@@ -394,7 +394,12 @@ elif page == "Add Invoice":
                         })
 
                         invoices = pd.concat([invoices, new_invoice], ignore_index=True)
-                        invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                        invoices["date"] = pd.to_datetime(
+    invoices["date"].astype(str).str.strip(),
+    errors="coerce",
+    format=None
+).dt.strftime("%Y-%m-%d")
+invoices["date"] = invoices["date"].fillna("")
 
                         save_invoices(invoices)
                         suppliers = recalculate_dues(suppliers, invoices)
