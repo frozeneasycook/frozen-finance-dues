@@ -94,7 +94,7 @@ def load_all():
     invoices["auto_unique_id"] = pd.to_numeric(invoices["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
 
     # Normalize / clean date format (keeps all invoices as YYYY-MM-DD)
-    invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce", infer_datetime_format=True).dt.strftime("%Y-%m-%d")
 
     # Ensure status
     invoices["status"] = invoices["status"].replace("", pd.NA).fillna("Unpaid")
