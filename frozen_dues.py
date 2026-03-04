@@ -4,11 +4,18 @@ import os
 from datetime import datetime
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 import io
+import requests
 
-# ---------------- FILES ----------------
-SUPPLIERS_FILE = "suppliers.csv"
-INVOICES_FILE = "invoices.csv"
-LOGO_PATH = "logo.png"  # <-- your attached logo
+# ---------------- FILES (logo only stays local in repo) ----------------
+LOGO_PATH = "logo.png"  # keep in GitHub repo
+
+# Google Sheets tabs (inside the same spreadsheet)
+SUPPLIERS_SHEET = "suppliers"
+INVOICES_SHEET = "invoices"
+
+# Columns (must match your sheet headers exactly)
+SUPPLIERS_COLS = ["supplier_name", "total_due"]
+INVOICES_COLS = ["date", "branch", "supplier", "full_amount", "paid_amount", "remaining", "status", "auto_unique_id"]
 
 # ---------------- BRAND COLORS (from your logo) ----------------
 BRAND_DARK_BLUE = "#001f3f"
@@ -19,64 +26,117 @@ BRAND_WHITE = "#FFFFFF"
 BRAND_GREEN = "#c8f7c5"   # Paid row background
 BRAND_RED = "#ffd6d6"     # Unpaid row background
 
+# ---------------- API (Google Apps Script Web App) ----------------
+def _get_api_conf():
+    """
+    Streamlit Cloud -> Settings -> Secrets must include:
+
+    [api]
+    url = "https://script.google.com/macros/s/XXXXX/exec"
+    token = "YOUR_SECRET_TOKEN"
+    """
+    if "api" not in st.secrets:
+        raise RuntimeError("Missing [api] in Streamlit Secrets.")
+    if "url" not in st.secrets["api"] or "token" not in st.secrets["api"]:
+        raise RuntimeError("Missing api.url or api.token in Streamlit Secrets.")
+    return st.secrets["api"]["url"], st.secrets["api"]["token"]
+
+
+def api_read(sheet_name: str, expected_cols: list[str]) -> pd.DataFrame:
+    url, token = _get_api_conf()
+    r = requests.get(
+        url,
+        params={"action": "read", "sheet": sheet_name, "token": token},
+        timeout=30
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error", "API error"))
+    df = pd.DataFrame(payload.get("data", []))
+    if df.empty:
+        df = pd.DataFrame(columns=expected_cols)
+    # Ensure required columns exist
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = "" if c not in ["full_amount", "paid_amount", "remaining", "total_due", "auto_unique_id"] else 0
+    df = df[expected_cols]
+    return df
+
+
+def api_write(sheet_name: str, df: pd.DataFrame):
+    url, token = _get_api_conf()
+    df = df.copy()
+    df = df.where(pd.notnull(df), "")
+    rows = df.to_dict("records")
+    r = requests.post(
+        url,
+        json={"action": "write", "sheet": sheet_name, "token": token, "rows": rows},
+        timeout=60
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error", "API error"))
+
+
 # ---------------- LOAD DATA ----------------
-if os.path.exists(SUPPLIERS_FILE):
-    suppliers = pd.read_csv(SUPPLIERS_FILE)
-else:
-    suppliers = pd.DataFrame(columns=["supplier_name", "total_due"])
-    suppliers.to_csv(SUPPLIERS_FILE, index=False)
+def load_all():
+    suppliers = api_read(SUPPLIERS_SHEET, SUPPLIERS_COLS)
+    invoices = api_read(INVOICES_SHEET, INVOICES_COLS)
 
-if os.path.exists(INVOICES_FILE):
-    invoices = pd.read_csv(INVOICES_FILE)
-else:
-    invoices = pd.DataFrame(columns=[
-        "date", "branch", "supplier", "full_amount", "paid_amount", "remaining", "status", "auto_unique_id"
-    ])
-    invoices.to_csv(INVOICES_FILE, index=False)
+    # Numeric safety
+    suppliers["total_due"] = pd.to_numeric(suppliers["total_due"], errors="coerce").fillna(0.0)
 
-# Ensure required columns exist
-if "status" not in invoices.columns:
-    invoices["status"] = "Unpaid"
-
-if "auto_unique_id" not in invoices.columns:
-    invoices["auto_unique_id"] = range(len(invoices))
-
-# Numeric safety
-for c in ["full_amount", "paid_amount", "remaining"]:
-    if c in invoices.columns:
+    for c in ["full_amount", "paid_amount", "remaining"]:
         invoices[c] = pd.to_numeric(invoices[c], errors="coerce").fillna(0.0)
 
-# Normalize / clean date format (keeps all invoices as YYYY-MM-DD)
-if "date" in invoices.columns:
+    invoices["auto_unique_id"] = pd.to_numeric(invoices["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
+
+    # Normalize / clean date format (keeps all invoices as YYYY-MM-DD)
     invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-# ---------------- BUSINESS LOGIC ----------------
-def recalculate_dues():
-    """Recalculate supplier total due from invoices (Unpaid remaining only)."""
-    global suppliers, invoices
+    # Ensure status
+    invoices["status"] = invoices["status"].replace("", pd.NA).fillna("Unpaid")
 
+    return suppliers, invoices
+
+
+# ---------------- BUSINESS LOGIC ----------------
+def recalculate_dues(suppliers: pd.DataFrame, invoices: pd.DataFrame) -> pd.DataFrame:
+    """Recalculate supplier total due from invoices (Unpaid remaining only)."""
     suppliers = suppliers.copy()
     invoices = invoices.copy()
 
     invoices["remaining"] = pd.to_numeric(invoices["remaining"], errors="coerce").fillna(0.0)
 
+    # Ensure supplier list includes suppliers found in invoices (in case someone typed supplier in invoices first)
+    inv_supps = set(invoices["supplier"].dropna().astype(str).tolist())
+    sup_supps = set(suppliers["supplier_name"].dropna().astype(str).tolist())
+    missing = sorted(list(inv_supps - sup_supps))
+    if missing:
+        suppliers = pd.concat(
+            [suppliers, pd.DataFrame({"supplier_name": missing, "total_due": [0.0] * len(missing)})],
+            ignore_index=True
+        )
+
     suppliers["total_due"] = 0.0
     unpaid = invoices[invoices["status"] == "Unpaid"].groupby("supplier")["remaining"].sum()
 
     suppliers = suppliers.set_index("supplier_name")
-    suppliers["total_due"] = suppliers["total_due"].add(unpaid, fill_value=0)
-    suppliers["total_due"] = suppliers["total_due"].clip(lower=0)
+    suppliers["total_due"] = suppliers["total_due"].add(unpaid, fill_value=0).clip(lower=0)
     suppliers.reset_index(inplace=True)
 
-    suppliers.to_csv(SUPPLIERS_FILE, index=False)
+    # Save suppliers back to sheet
+    api_write(SUPPLIERS_SHEET, suppliers[SUPPLIERS_COLS])
+    return suppliers
 
 
-def save_invoices():
-    global invoices
-    invoices.to_csv(INVOICES_FILE, index=False)
+def save_invoices(invoices: pd.DataFrame):
+    api_write(INVOICES_SHEET, invoices[INVOICES_COLS])
 
 
-def next_invoice_id():
+def next_invoice_id(invoices: pd.DataFrame) -> int:
     if invoices.empty:
         return 0
     return int(pd.to_numeric(invoices["auto_unique_id"], errors="coerce").fillna(-1).max()) + 1
@@ -104,20 +164,14 @@ def normalize_selected_rows(grid_response):
 
 
 def get_filtered_rows(grid_response, fallback_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Get the currently visible/filtered rows from AgGrid response.
-    This is what we use to compute sums that change with filters.
-    """
+    """Get the currently visible/filtered rows from AgGrid response."""
     if not grid_response:
         return fallback_df
-
     data = grid_response.get("data", None)
     if data is None:
         return fallback_df
-
     try:
-        df = pd.DataFrame(data)
-        return df
+        return pd.DataFrame(data)
     except Exception:
         return fallback_df
 
@@ -133,10 +187,7 @@ def clamp_session_number(key: str, min_v: float, max_v: float):
 
 
 # ---------------- UI CONFIG ----------------
-st.set_page_config(
-    page_title="Frozen Products Invoice Management",
-    layout="wide"
-)
+st.set_page_config(page_title="Frozen Products Invoice Management", layout="wide")
 
 # Branding CSS
 st.markdown(f"""
@@ -198,9 +249,16 @@ st.title("Frozen Products Invoice Management")
 
 # ---------------- NAV ----------------
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Add Supplier", "Add Invoice", "View Dues", "View Invoices", "Reset"])
+page = st.sidebar.radio("Go to", ["Add Supplier", "Add Invoice", "View Dues", "View Invoices"])
 
 branches = ["Frozen Obour", "Frozen Shrouq", "Frozen Mostakbal", "Frozen Zayed", "Frozen Heliopolis", "Frozen Maadi"]
+
+# ---------------- LOAD LATEST DATA (multi-user) ----------------
+try:
+    suppliers, invoices = load_all()
+except Exception as e:
+    st.error(f"Failed to load data from Google Sheet API: {e}")
+    st.stop()
 
 # ---------------- ADD SUPPLIER ----------------
 if page == "Add Supplier":
@@ -208,14 +266,17 @@ if page == "Add Supplier":
     new_supplier = st.text_input("Supplier Name")
 
     if st.button("Add Supplier"):
-        if new_supplier.strip() == "":
+        new_supplier = new_supplier.strip()
+        if new_supplier == "":
             st.error("Supplier name cannot be empty.")
-        elif new_supplier in suppliers["supplier_name"].values:
+        elif new_supplier in suppliers["supplier_name"].astype(str).values:
             st.error("Supplier already exists.")
         else:
-            new_row = pd.DataFrame({"supplier_name": [new_supplier], "total_due": [0.0]})
-            suppliers = pd.concat([suppliers, new_row], ignore_index=True)
-            suppliers.to_csv(SUPPLIERS_FILE, index=False)
+            suppliers = pd.concat(
+                [suppliers, pd.DataFrame({"supplier_name": [new_supplier], "total_due": [0.0]})],
+                ignore_index=True
+            )
+            api_write(SUPPLIERS_SHEET, suppliers[SUPPLIERS_COLS])
             st.success(f"Supplier '{new_supplier}' added successfully.")
             st.rerun()
 
@@ -240,7 +301,7 @@ elif page == "Add Invoice":
         if "inv_branch" not in st.session_state:
             st.session_state["inv_branch"] = branches[0]
         if "inv_supplier" not in st.session_state:
-            st.session_state["inv_supplier"] = suppliers["supplier_name"].tolist()[0]
+            st.session_state["inv_supplier"] = suppliers["supplier_name"].astype(str).tolist()[0]
         if "inv_date" not in st.session_state:
             st.session_state["inv_date"] = datetime.now().date()
         if "inv_full" not in st.session_state:
@@ -256,7 +317,7 @@ elif page == "Add Invoice":
 
         # ---- widgets (with keys) ----
         branch = st.selectbox("Branch", branches, key="inv_branch")
-        supplier = st.selectbox("Supplier", suppliers["supplier_name"].tolist(), key="inv_supplier")
+        supplier = st.selectbox("Supplier", suppliers["supplier_name"].astype(str).tolist(), key="inv_supplier")
         invoice_date = st.date_input("Invoice Date", key="inv_date")
 
         full_amount = st.number_input("Full Invoice Amount", min_value=0.0, step=0.01, key="inv_full")
@@ -318,6 +379,9 @@ elif page == "Add Invoice":
 
                 with c_yes:
                     if st.button("✅ Yes, Submit Now"):
+                        # Reload latest to reduce overwrites in multi-user usage
+                        suppliers, invoices = load_all()
+
                         new_invoice = pd.DataFrame({
                             "date": [p["date"]],
                             "branch": [p["branch"]],
@@ -326,14 +390,14 @@ elif page == "Add Invoice":
                             "paid_amount": [p["paid_amount"]],
                             "remaining": [p["remaining"]],
                             "status": ["Unpaid" if p["remaining"] > 0 else "Paid"],
-                            "auto_unique_id": [next_invoice_id()],
+                            "auto_unique_id": [next_invoice_id(invoices)],
                         })
 
                         invoices = pd.concat([invoices, new_invoice], ignore_index=True)
                         invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-                        save_invoices()
-                        recalculate_dues()
+                        save_invoices(invoices)
+                        suppliers = recalculate_dues(suppliers, invoices)
 
                         # Close confirmation + clear pending
                         st.session_state["confirm_invoice_open"] = False
@@ -457,6 +521,9 @@ elif page == "View Invoices":
 
             with colA:
                 if st.button("Toggle Status"):
+                    # Reload latest before write
+                    suppliers, invoices = load_all()
+
                     ids = [int(r["auto_unique_id"]) for r in selected_rows if "auto_unique_id" in r]
                     if ids:
                         mask = invoices["auto_unique_id"].isin(ids)
@@ -467,8 +534,8 @@ elif page == "View Invoices":
                         paid_mask = mask & (invoices["status"] == "Paid")
                         invoices.loc[paid_mask, "remaining"] = 0.0
 
-                        save_invoices()
-                        recalculate_dues()
+                        save_invoices(invoices)
+                        suppliers = recalculate_dues(suppliers, invoices)
                         st.rerun()
 
             with colB:
@@ -516,6 +583,9 @@ elif page == "View Invoices":
                             if payment <= 0:
                                 st.error("Payment must be greater than 0.")
                             else:
+                                # Reload latest before write
+                                suppliers, invoices = load_all()
+
                                 sel_df = invoices[invoices["auto_unique_id"].isin(ids)].copy()
                                 sel_df["date_sort"] = pd.to_datetime(sel_df["date"], errors="coerce")
                                 sel_df = sel_df.sort_values("date_sort").drop(columns=["date_sort"])
@@ -550,8 +620,8 @@ elif page == "View Invoices":
 
                                     remaining_payment -= pay_here
 
-                                save_invoices()
-                                recalculate_dues()
+                                save_invoices(invoices)
+                                suppliers = recalculate_dues(suppliers, invoices)
                                 st.session_state["partial_payment_open"] = False
                                 st.success("Payment applied successfully.")
                                 st.rerun()
@@ -573,10 +643,14 @@ elif page == "View Invoices":
                 d1, d2 = st.columns(2)
                 with d1:
                     if st.button("✅ Yes, Delete Now"):
+                        # Reload latest before write
+                        suppliers, invoices = load_all()
+
                         if ids:
                             invoices = invoices[~invoices["auto_unique_id"].isin(ids)].reset_index(drop=True)
-                            save_invoices()
-                            recalculate_dues()
+                            save_invoices(invoices)
+                            suppliers = recalculate_dues(suppliers, invoices)
+
                         st.session_state["delete_confirm_open"] = False
                         st.success("Deleted successfully.")
                         st.rerun()
@@ -597,22 +671,3 @@ elif page == "View Invoices":
             file_name="invoices.xlsx",
             mime="application/vnd.ms-excel"
         )
-
-# ---------------- RESET ----------------
-elif page == "Reset":
-    st.header("Reset")
-    password = st.text_input("Password", type="password")
-
-    if password == "c12q7mgh":
-        if st.button("Reset All Data"):
-            suppliers = pd.DataFrame(columns=["supplier_name", "total_due"])
-            invoices = pd.DataFrame(columns=[
-                "date", "branch", "supplier", "full_amount", "paid_amount", "remaining", "status", "auto_unique_id"
-            ])
-            suppliers.to_csv(SUPPLIERS_FILE, index=False)
-            invoices.to_csv(INVOICES_FILE, index=False)
-            st.success("All data reset successfully.")
-            st.rerun()
-    else:
-        if password:
-            st.error("Incorrect password.")
