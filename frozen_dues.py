@@ -351,6 +351,7 @@ page = st.sidebar.radio(
     ["Add Supplier", "Add Invoice", "View Dues", "View Invoices", "Reset (Admin)"],
 )
 
+# Load data
 try:
     suppliers, invoices = load_all()
 except Exception as e:
@@ -358,38 +359,60 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-# Add Supplier
+# Add Supplier (FIXED: use callback to clear widget key safely)
 # =========================================================
+if "supplier_add_msg" not in st.session_state:
+    st.session_state["supplier_add_msg"] = None  # ("success"|"error", "text")
+
+def add_supplier_callback():
+    """Runs BEFORE the script reruns. Safe place to modify st.session_state keys."""
+    try:
+        suppliers_local, invoices_local = load_all()
+        name = (st.session_state.get("new_supplier_name", "") or "").strip()
+
+        if name == "":
+            st.session_state["supplier_add_msg"] = ("error", "Supplier name cannot be empty.")
+            return
+
+        if name in suppliers_local["supplier_name"].astype(str).values:
+            st.session_state["supplier_add_msg"] = ("error", "Supplier already exists.")
+            return
+
+        suppliers_local = pd.concat(
+            [suppliers_local, pd.DataFrame({"supplier_name": [name], "total_due": [0.0], "credit_balance": [0.0]})],
+            ignore_index=True,
+        )
+        save_all(suppliers_local, invoices_local)
+
+        # Clear input so placeholder shows again
+        st.session_state["new_supplier_name"] = ""
+        st.session_state["supplier_add_msg"] = ("success", f"Supplier '{name}' added.")
+
+    except Exception as ex:
+        st.session_state["supplier_add_msg"] = ("error", f"Failed to add supplier: {ex}")
+
 if page == "Add Supplier":
     st.header("Add New Supplier")
+
+    # show message from previous callback run
+    if st.session_state["supplier_add_msg"]:
+        kind, txt = st.session_state["supplier_add_msg"]
+        if kind == "success":
+            st.success(txt)
+        else:
+            st.error(txt)
+        st.session_state["supplier_add_msg"] = None
 
     if "new_supplier_name" not in st.session_state:
         st.session_state["new_supplier_name"] = ""
 
-    new_supplier = st.text_input(
+    st.text_input(
         "Supplier Name",
         key="new_supplier_name",
         placeholder="please add new supplier",
     )
 
-    if st.button("Add Supplier"):
-        name = (new_supplier or "").strip()
-        if name == "":
-            st.error("Supplier name cannot be empty.")
-        elif name in suppliers["supplier_name"].astype(str).values:
-            st.error("Supplier already exists.")
-        else:
-            suppliers = pd.concat(
-                [suppliers, pd.DataFrame({"supplier_name": [name], "total_due": [0.0], "credit_balance": [0.0]})],
-                ignore_index=True,
-            )
-            save_all(suppliers, invoices)
-
-            # clear input to show placeholder again
-            st.session_state["new_supplier_name"] = ""
-
-            st.success(f"Supplier '{name}' added.")
-            st.rerun()
+    st.button("Add Supplier", on_click=add_supplier_callback)
 
 # =========================================================
 # Add Invoice
@@ -511,7 +534,6 @@ elif page == "View Invoices":
     if invoices.empty:
         st.info("No invoices yet.")
     else:
-        # Row background
         row_style = JsCode(
             f"""
             function(params) {{
@@ -524,14 +546,12 @@ elif page == "View Invoices":
             """
         )
 
-        # Build a display df with a checkbox column that ALWAYS returns in grid_response["data"]
         display_df = invoices.copy()
         display_df.insert(0, "_select", False)
 
         gb = GridOptionsBuilder.from_dataframe(display_df)
         gb.configure_default_column(editable=False, filterable=False, sortable=True)
 
-        # checkbox column (editable)
         gb.configure_column(
             "_select",
             header_name="Select",
@@ -541,7 +561,6 @@ elif page == "View Invoices":
             pinned="left",
         )
 
-        # Filters only on date/branch/supplier/status
         gb.configure_column("date", header_name="Invoice Date", filter="agTextColumnFilter", filterable=True)
         gb.configure_column("branch", filter="agTextColumnFilter", filterable=True)
         gb.configure_column("supplier", filter="agTextColumnFilter", filterable=True)
@@ -562,7 +581,6 @@ elif page == "View Invoices":
             allow_unsafe_jscode=True,
         )
 
-        # Pull filtered data and selected via _select
         grid_data = pd.DataFrame(grid_response.get("data", display_df.to_dict("records")))
         if "_select" not in grid_data.columns:
             grid_data["_select"] = False
@@ -622,7 +640,6 @@ elif page == "View Invoices":
                         continue
                     i = id_to_idx[inv_id]
 
-                    # ensure numeric
                     for c in ["paid_cash", "paid_visa", "invoice_amount", "delivery_cost"]:
                         invoices.at[i, c] = float(pd.to_numeric(invoices.at[i, c], errors="coerce") or 0.0)
 
