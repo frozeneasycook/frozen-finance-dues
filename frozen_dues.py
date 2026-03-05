@@ -15,7 +15,7 @@ RESET_PASSWORD = "c12q7mgh"
 SUPPLIERS_SHEET = "suppliers"
 INVOICES_SHEET = "invoices"
 
-# NEW (extended) schema (works even if old sheets exist; app will auto-upgrade)
+# NEW (extended) schema
 SUPPLIERS_COLS = ["supplier_name", "total_due", "credit_balance"]
 
 INVOICES_COLS = [
@@ -29,7 +29,7 @@ INVOICES_COLS = [
     "paid_cash",
     "paid_visa",
     "payment_date",       # last payment date
-    "payment_note",       # e.g. "Partial - Cash", "Visa", etc.
+    "payment_note",       # note/method
     "remaining",          # max(total_due - paid_total, 0)
     "credit",             # max(paid_total - total_due, 0)
     "status",             # Unpaid / Partial / Paid / Credit
@@ -52,9 +52,9 @@ BRAND_DARK_BLUE = "#001f3f"
 BRAND_LIGHT_BLUE = "#ADD8E6"
 BRAND_YELLOW = "#FFDC00"
 BRAND_WHITE = "#FFFFFF"
-BRAND_GREEN = "#c8f7c5"  # Paid rows
-BRAND_RED = "#ffd6d6"    # Unpaid/Partial rows
-BRAND_AMBER = "#fff2cc"  # Credit rows
+BRAND_GREEN = "#c8f7c5"  # Paid
+BRAND_RED = "#ffd6d6"    # Unpaid/Partial
+BRAND_AMBER = "#fff2cc"  # Credit
 
 # =========================================================
 # API (Google Apps Script Web App)
@@ -73,32 +73,35 @@ def _get_api_conf():
 
 def api_read(sheet_name: str) -> pd.DataFrame:
     url, token = _get_api_conf()
-    r = requests.get(
-        url,
-        params={"action": "read", "sheet": sheet_name, "token": token},
-        timeout=30,
-    )
+    r = requests.get(url, params={"action": "read", "sheet": sheet_name, "token": token}, timeout=30)
+
     text = (r.text or "").strip()
     if not text.startswith("{"):
         raise RuntimeError(f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}")
+
     payload = r.json()
     if not payload.get("ok"):
         raise RuntimeError(payload.get("error", "API error"))
+
     return pd.DataFrame(payload.get("data", []))
 
 
 def api_write(sheet_name: str, df: pd.DataFrame):
     url, token = _get_api_conf()
+
     df = df.copy()
     df = df.where(pd.notnull(df), "")
+
     r = requests.post(
         url,
         json={"action": "write", "sheet": sheet_name, "token": token, "rows": df.to_dict("records")},
         timeout=60,
     )
+
     text = (r.text or "").strip()
     if not text.startswith("{"):
         raise RuntimeError(f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}")
+
     payload = r.json()
     if not payload.get("ok"):
         raise RuntimeError(payload.get("error", "API error"))
@@ -131,7 +134,6 @@ def _to_yyyy_mm_dd(x) -> str:
         except Exception:
             return ""
 
-    # serial number
     try:
         num = float(x)
         if 20000 < num < 80000:
@@ -165,9 +167,7 @@ def _normalize_dates(series: pd.Series) -> pd.Series:
 
 # =========================================================
 # MIGRATION / NORMALIZATION
-# Supports old sheet headers:
-# invoices: date,branch,supplier,full_amount,paid_amount,remaining,status,auto_unique_id
-# suppliers: supplier_name,total_due
+# Supports old headers too
 # =========================================================
 def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     df = df.copy()
@@ -180,8 +180,7 @@ def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 def migrate_invoices(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
     if df.empty:
-        df = pd.DataFrame(columns=INVOICES_COLS)
-        return df
+        return pd.DataFrame(columns=INVOICES_COLS)
 
     # Old -> new mapping if old columns exist
     if "full_amount" in df.columns and "invoice_amount" not in df.columns:
@@ -189,14 +188,15 @@ def migrate_invoices(raw: pd.DataFrame) -> pd.DataFrame:
     if "paid_amount" in df.columns and "paid_total" not in df.columns:
         df["paid_total"] = df["paid_amount"]
 
-    # Fill defaults for new columns
-    df = ensure_columns(df, [
-        "date","branch","supplier","invoice_amount","delivery_cost","total_due",
-        "paid_total","paid_cash","paid_visa","payment_date","payment_note",
-        "remaining","credit","status","auto_unique_id"
-    ])
+    df = ensure_columns(
+        df,
+        [
+            "date", "branch", "supplier", "invoice_amount", "delivery_cost", "total_due",
+            "paid_total", "paid_cash", "paid_visa", "payment_date", "payment_note",
+            "remaining", "credit", "status", "auto_unique_id"
+        ],
+    )
 
-    # Types
     df["date"] = _normalize_dates(df["date"])
     df["payment_date"] = _normalize_dates(df["payment_date"])
 
@@ -205,20 +205,15 @@ def migrate_invoices(raw: pd.DataFrame) -> pd.DataFrame:
 
     df["auto_unique_id"] = pd.to_numeric(df["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
 
-    # Compute totals safely
     df["total_due"] = (df["invoice_amount"] + df["delivery_cost"]).round(2)
 
-    # If paid_cash/paid_visa are empty but paid_total exists, keep paid_total.
-    # If paid_cash+paid_visa > 0, recompute paid_total from them.
     has_split = (df["paid_cash"] + df["paid_visa"]) > 0
     df.loc[has_split, "paid_total"] = (df.loc[has_split, "paid_cash"] + df.loc[has_split, "paid_visa"]).round(2)
 
-    # Remaining / credit
     diff = (df["total_due"] - df["paid_total"]).round(2)
     df["remaining"] = diff.clip(lower=0).round(2)
     df["credit"] = (-diff).clip(lower=0).round(2)
 
-    # Status
     def status_row(r):
         if r["credit"] > 0:
             return "Credit"
@@ -236,8 +231,7 @@ def migrate_invoices(raw: pd.DataFrame) -> pd.DataFrame:
 def migrate_suppliers(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
     if df.empty:
-        df = pd.DataFrame(columns=SUPPLIERS_COLS)
-        return df
+        return pd.DataFrame(columns=SUPPLIERS_COLS)
 
     df = ensure_columns(df, ["supplier_name", "total_due", "credit_balance"])
     df["total_due"] = pd.to_numeric(df["total_due"], errors="coerce").fillna(0.0)
@@ -260,7 +254,7 @@ def recalc_supplier_balances(suppliers: pd.DataFrame, invoices: pd.DataFrame) ->
     missing = sorted(list(inv_supps - sup_supps))
     if missing:
         suppliers = pd.concat(
-            [suppliers, pd.DataFrame({"supplier_name": missing, "total_due": [0.0]*len(missing), "credit_balance":[0.0]*len(missing)})],
+            [suppliers, pd.DataFrame({"supplier_name": missing, "total_due": [0.0]*len(missing), "credit_balance": [0.0]*len(missing)})],
             ignore_index=True,
         )
 
@@ -268,8 +262,8 @@ def recalc_supplier_balances(suppliers: pd.DataFrame, invoices: pd.DataFrame) ->
     credit_by_supplier = invoices.groupby("supplier")["credit"].sum()
 
     suppliers = suppliers.set_index("supplier_name")
-    suppliers["total_due"] = suppliers.index.map(lambda s: float(due_by_supplier.get(s, 0.0))).astype(float)
-    suppliers["credit_balance"] = suppliers.index.map(lambda s: float(credit_by_supplier.get(s, 0.0))).astype(float)
+    suppliers["total_due"] = suppliers.index.map(lambda s: float(due_by_supplier.get(s, 0.0)))
+    suppliers["credit_balance"] = suppliers.index.map(lambda s: float(credit_by_supplier.get(s, 0.0)))
     suppliers.reset_index(inplace=True)
 
     suppliers["total_due"] = pd.to_numeric(suppliers["total_due"], errors="coerce").fillna(0.0)
@@ -283,9 +277,7 @@ def load_all():
 
     suppliers = migrate_suppliers(raw_suppliers)
     invoices = migrate_invoices(raw_invoices)
-
     suppliers = recalc_supplier_balances(suppliers, invoices)
-
     return suppliers, invoices
 
 
@@ -293,6 +285,41 @@ def save_all(suppliers: pd.DataFrame, invoices: pd.DataFrame):
     suppliers = recalc_supplier_balances(suppliers, invoices)
     api_write(INVOICES_SHEET, ensure_columns(invoices, INVOICES_COLS))
     api_write(SUPPLIERS_SHEET, ensure_columns(suppliers, SUPPLIERS_COLS))
+
+
+def safe_selected_rows(grid_response) -> list[dict]:
+    """
+    st_aggrid sometimes returns selected_rows as:
+    - list[dict]
+    - pandas.DataFrame
+    - dict
+    - None
+    We must NEVER use `or []` with a DataFrame (causes ValueError).
+    """
+    if not isinstance(grid_response, dict):
+        return []
+
+    sr = grid_response.get("selected_rows", None)
+
+    if sr is None:
+        return []
+
+    # DataFrame
+    if hasattr(sr, "to_dict") and callable(sr.to_dict):
+        try:
+            return sr.to_dict("records")
+        except Exception:
+            return []
+
+    # single dict
+    if isinstance(sr, dict):
+        return [sr]
+
+    # list of dicts
+    if isinstance(sr, list):
+        return [x for x in sr if isinstance(x, dict)]
+
+    return []
 
 
 # =========================================================
@@ -362,7 +389,7 @@ if page == "Add Supplier":
             st.error("Supplier already exists.")
         else:
             suppliers = pd.concat(
-                [suppliers, pd.DataFrame({"supplier_name": [name], "total_due": [0.0], "credit_balance":[0.0]})],
+                [suppliers, pd.DataFrame({"supplier_name": [name], "total_due": [0.0], "credit_balance": [0.0]})],
                 ignore_index=True,
             )
             save_all(suppliers, invoices)
@@ -395,7 +422,7 @@ elif page == "Add Invoice":
 
         total_due = float(invoice_amount + delivery_cost)
 
-        st.subheader("Payment Details (can be 0, partial, full, or overpaid)")
+        st.subheader("Payment Details (0 / partial / full / overpaid)")
         p1, p2, p3 = st.columns(3)
         with p1:
             payment_date = st.date_input("Payment Date", datetime.now().date())
@@ -405,8 +432,6 @@ elif page == "Add Invoice":
             paid_visa = st.number_input("Paid Visa", min_value=0.0, step=0.01, value=0.0)
 
         paid_total = float(paid_cash + paid_visa)
-
-        # Remaining / credit
         remaining = max(total_due - paid_total, 0.0)
         credit = max(paid_total - total_due, 0.0)
 
@@ -442,7 +467,6 @@ elif page == "Add Invoice":
         )
 
         if st.button("Submit Invoice"):
-            # reload latest to reduce overwrites
             suppliers, invoices = load_all()
 
             new_row = {
@@ -464,7 +488,7 @@ elif page == "Add Invoice":
             }
 
             invoices = pd.concat([invoices, pd.DataFrame([new_row])], ignore_index=True)
-            invoices = migrate_invoices(invoices)  # normalize
+            invoices = migrate_invoices(invoices)
 
             save_all(suppliers, invoices)
             st.success("Invoice added.")
@@ -492,23 +516,8 @@ elif page == "View Dues":
     gb = GridOptionsBuilder.from_dataframe(suppliers)
     gb.configure_default_column(editable=False, filterable=True, sortable=True)
     gb.configure_column("supplier_name", filter="agTextColumnFilter")
-    gb.configure_column("total_due", type=["numericColumn"], valueFormatter="data.total_due.toFixed(2)")
-    gb.configure_column("credit_balance", type=["numericColumn"], valueFormatter="data.credit_balance.toFixed(2)")
     grid_options = gb.build()
-
     AgGrid(suppliers, grid_options, height=450, fit_columns_on_grid_load=True)
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        suppliers.to_excel(writer, index=False, sheet_name="Dues")
-    buf.seek(0)
-
-    st.download_button(
-        "Download Dues as Excel",
-        data=buf,
-        file_name="supplier_dues.xlsx",
-        mime="application/vnd.ms-excel",
-    )
 
 # =========================================================
 # View Invoices + Apply Payment
@@ -542,14 +551,9 @@ elif page == "View Invoices":
         gb.configure_column("supplier", filter="agTextColumnFilter", filterable=True)
         gb.configure_column("status", filter="agTextColumnFilter", filterable=True)
 
-        # Hide technical id
         gb.configure_column("auto_unique_id", hide=True)
+        gb.configure_selection("single", use_checkbox=True)
 
-        # Numeric formatting
-        for c in ["invoice_amount", "delivery_cost", "total_due", "paid_total", "paid_cash", "paid_visa", "remaining", "credit"]:
-            gb.configure_column(c, type=["numericColumn"], valueFormatter=f"Number(data.{c}).toFixed(2)")
-
-        gb.configure_selection("single", use_checkbox=True)  # select ONE invoice to apply payment
         grid_options = gb.build()
         grid_options["getRowStyle"] = row_style
 
@@ -563,7 +567,6 @@ elif page == "View Invoices":
             allow_unsafe_jscode=True,
         )
 
-        # Filtered total remaining
         filtered_df = pd.DataFrame(grid_response.get("data", invoices.to_dict("records")))
         filtered_remaining_sum = float(pd.to_numeric(filtered_df.get("remaining", 0), errors="coerce").fillna(0).sum())
         st.markdown(
@@ -571,17 +574,15 @@ elif page == "View Invoices":
             unsafe_allow_html=True,
         )
 
-        # Apply payment to selected invoice
-        selected_rows = grid_response.get("selected_rows", []) or []
-        if isinstance(selected_rows, pd.DataFrame):
-            selected_rows = selected_rows.to_dict("records")
+        # ✅ FIXED selection handling
+        selected_rows = safe_selected_rows(grid_response)
 
         st.subheader("Update / Add Payment (select ONE invoice above)")
         if not selected_rows:
             st.info("Select one invoice row (checkbox) to apply a payment.")
         else:
             sel = selected_rows[0]
-            inv_id = int(sel.get("auto_unique_id", -1))
+            inv_id = int(pd.to_numeric(sel.get("auto_unique_id", -1), errors="coerce") or -1)
 
             st.markdown(
                 f"<div class='brand-card'><b>Selected Invoice:</b> {sel.get('supplier','')} | {sel.get('branch','')} | ID: {inv_id}</div>",
@@ -599,7 +600,6 @@ elif page == "View Invoices":
             note2 = st.text_input("Payment Note (e.g. Partial - Cash/Visa)", value="", key="pay_note_update")
 
             if st.button("Apply Payment to Selected Invoice"):
-                # reload latest
                 suppliers, invoices = load_all()
 
                 mask = invoices["auto_unique_id"].astype(int) == inv_id
@@ -609,17 +609,16 @@ elif page == "View Invoices":
 
                 i = invoices[mask].index[0]
 
-                # Update paid splits
-                invoices.at[i, "paid_cash"] = float(pd.to_numeric(invoices.at[i, "paid_cash"], errors="coerce") or 0) + float(add_cash)
-                invoices.at[i, "paid_visa"] = float(pd.to_numeric(invoices.at[i, "paid_visa"], errors="coerce") or 0) + float(add_visa)
-
+                invoices.at[i, "paid_cash"] = float(pd.to_numeric(invoices.at[i, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
+                invoices.at[i, "paid_visa"] = float(pd.to_numeric(invoices.at[i, "paid_visa"], errors="coerce") or 0.0) + float(add_visa)
                 invoices.at[i, "paid_total"] = float(invoices.at[i, "paid_cash"]) + float(invoices.at[i, "paid_visa"])
-                invoices.at[i, "payment_date"] = pay_date2.strftime("%Y-%m-%d") if (float(add_cash) + float(add_visa)) > 0 else invoices.at[i, "payment_date"]
+
+                if (float(add_cash) + float(add_visa)) > 0:
+                    invoices.at[i, "payment_date"] = pay_date2.strftime("%Y-%m-%d")
 
                 if (note2 or "").strip():
                     invoices.at[i, "payment_note"] = (note2 or "").strip()
                 else:
-                    # auto note if not provided
                     parts = []
                     if float(add_cash) > 0:
                         parts.append("Cash")
@@ -628,52 +627,18 @@ elif page == "View Invoices":
                     if parts:
                         invoices.at[i, "payment_note"] = " + ".join(parts)
 
-                # Recompute totals and status
-                invoices.at[i, "date"] = _to_yyyy_mm_dd(invoices.at[i, "date"])
-                invoices.at[i, "payment_date"] = _to_yyyy_mm_dd(invoices.at[i, "payment_date"])
-
-                for c in ["invoice_amount", "delivery_cost"]:
-                    invoices.at[i, c] = float(pd.to_numeric(invoices.at[i, c], errors="coerce") or 0.0)
-
-                invoices.at[i, "total_due"] = float(invoices.at[i, "invoice_amount"]) + float(invoices.at[i, "delivery_cost"])
-
-                diff = round(float(invoices.at[i, "total_due"]) - float(invoices.at[i, "paid_total"]), 2)
-                invoices.at[i, "remaining"] = round(max(diff, 0.0), 2)
-                invoices.at[i, "credit"] = round(max(-diff, 0.0), 2)
-
-                if float(invoices.at[i, "credit"]) > 0:
-                    invoices.at[i, "status"] = "Credit"
-                elif float(invoices.at[i, "remaining"]) == 0 and float(invoices.at[i, "paid_total"]) > 0:
-                    invoices.at[i, "status"] = "Paid"
-                elif float(invoices.at[i, "paid_total"]) > 0 and float(invoices.at[i, "remaining"]) > 0:
-                    invoices.at[i, "status"] = "Partial"
-                else:
-                    invoices.at[i, "status"] = "Unpaid"
-
                 invoices = migrate_invoices(invoices)
                 save_all(suppliers, invoices)
+
                 st.success("Payment applied.")
                 st.rerun()
-
-        # Download
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-            invoices.to_excel(writer, index=False, sheet_name="Invoices")
-        buf.seek(0)
-        st.download_button(
-            "Download Invoices as Excel",
-            data=buf,
-            file_name="invoices.xlsx",
-            mime="application/vnd.ms-excel",
-        )
 
 # =========================================================
 # Reset (Admin)
 # =========================================================
 elif page == "Reset (Admin)":
     st.header("Reset Data (Admin)")
-
-    st.warning("This will DELETE all rows in suppliers and invoices (keeps headers). This action cannot be undone.")
+    st.warning("This will DELETE all rows in suppliers and invoices (keeps headers). Cannot be undone.")
 
     pw = st.text_input("Enter password to enable reset", type="password")
     confirm = st.checkbox("I understand this will delete all data")
@@ -686,12 +651,8 @@ elif page == "Reset (Admin)":
             st.error("You must confirm the checkbox.")
             st.stop()
 
-        # Clear data by writing empty tables (Apps Script clears everything below header)
-        empty_sup = pd.DataFrame(columns=SUPPLIERS_COLS)
-        empty_inv = pd.DataFrame(columns=INVOICES_COLS)
-
-        api_write(SUPPLIERS_SHEET, empty_sup)
-        api_write(INVOICES_SHEET, empty_inv)
+        api_write(SUPPLIERS_SHEET, pd.DataFrame(columns=SUPPLIERS_COLS))
+        api_write(INVOICES_SHEET, pd.DataFrame(columns=INVOICES_COLS))
 
         st.success("Reset completed. Reloading...")
         st.rerun()
