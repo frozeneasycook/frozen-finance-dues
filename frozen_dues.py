@@ -179,7 +179,6 @@ def migrate_invoices(raw: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=INVOICES_COLS)
 
-    # old -> new
     if "full_amount" in df.columns and "invoice_amount" not in df.columns:
         df["invoice_amount"] = df["full_amount"]
     if "paid_amount" in df.columns and "paid_total" not in df.columns:
@@ -364,7 +363,6 @@ except Exception as e:
 if "supplier_add_msg" not in st.session_state:
     st.session_state["supplier_add_msg"] = None  # ("success"|"error", "text")
 
-
 def add_supplier_callback():
     try:
         suppliers_local, invoices_local = load_all()
@@ -389,16 +387,12 @@ def add_supplier_callback():
     except Exception as ex:
         st.session_state["supplier_add_msg"] = ("error", f"Failed to add supplier: {ex}")
 
-
 if page == "Add Supplier":
     st.header("Add New Supplier")
 
     if st.session_state["supplier_add_msg"]:
         kind, txt = st.session_state["supplier_add_msg"]
-        if kind == "success":
-            st.success(txt)
-        else:
-            st.error(txt)
+        st.success(txt) if kind == "success" else st.error(txt)
         st.session_state["supplier_add_msg"] = None
 
     if "new_supplier_name" not in st.session_state:
@@ -413,54 +407,144 @@ if page == "Add Supplier":
     st.button("Add Supplier", on_click=add_supplier_callback)
 
 # =========================================================
-# Add Invoice (UPDATED: default Select... placeholders)
+# Add Invoice (FIXED RESET TO DEFAULT AFTER SUBMIT)
 # =========================================================
 elif page == "Add Invoice":
     st.header("Add New Invoice")
 
+    if "invoice_add_msg" not in st.session_state:
+        st.session_state["invoice_add_msg"] = None  # ("success"|"error", "text")
+
+    # init defaults once
+    defaults = {
+        "inv_branch": "Select Branch",
+        "inv_supplier": "Select Supplier",
+        "inv_date": None,
+        "pay_date": None,
+        "inv_amount": 0.0,
+        "del_cost": 0.0,
+        "paid_cash": 0.0,
+        "paid_visa": 0.0,
+        "pay_note": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    def add_invoice_callback():
+        try:
+            suppliers_local, invoices_local = load_all()
+
+            branch = st.session_state.get("inv_branch", "Select Branch")
+            supplier = st.session_state.get("inv_supplier", "Select Supplier")
+            invoice_date = st.session_state.get("inv_date", None)
+            payment_date = st.session_state.get("pay_date", None)
+
+            invoice_amount = float(st.session_state.get("inv_amount", 0.0) or 0.0)
+            delivery_cost = float(st.session_state.get("del_cost", 0.0) or 0.0)
+            paid_cash = float(st.session_state.get("paid_cash", 0.0) or 0.0)
+            paid_visa = float(st.session_state.get("paid_visa", 0.0) or 0.0)
+            note = (st.session_state.get("pay_note", "") or "").strip()
+
+            errors = []
+            if branch == "Select Branch":
+                errors.append("Please select a Branch.")
+            if supplier == "Select Supplier":
+                errors.append("Please select a Supplier.")
+            if invoice_date is None:
+                errors.append("Please select an Invoice Date.")
+            if (paid_cash + paid_visa) > 0 and payment_date is None:
+                errors.append("Please select a Payment Date (because paid amount > 0).")
+
+            if errors:
+                st.session_state["invoice_add_msg"] = ("error", " | ".join(errors))
+                return
+
+            total_due = float(invoice_amount + delivery_cost)
+            paid_total = float(paid_cash + paid_visa)
+            remaining = max(total_due - paid_total, 0.0)
+            credit = max(paid_total - total_due, 0.0)
+
+            if credit > 0:
+                status = "Credit"
+            elif remaining == 0 and paid_total > 0:
+                status = "Paid"
+            elif paid_total > 0 and remaining > 0:
+                status = "Partial"
+            else:
+                status = "Unpaid"
+
+            new_row = {
+                "date": invoice_date.strftime("%Y-%m-%d"),
+                "branch": branch,
+                "supplier": supplier,
+                "invoice_amount": float(invoice_amount),
+                "delivery_cost": float(delivery_cost),
+                "total_due": float(total_due),
+                "paid_total": float(paid_total),
+                "paid_cash": float(paid_cash),
+                "paid_visa": float(paid_visa),
+                "payment_date": payment_date.strftime("%Y-%m-%d") if paid_total > 0 else "",
+                "payment_note": note,
+                "remaining": float(remaining),
+                "credit": float(credit),
+                "status": status,
+                "auto_unique_id": next_invoice_id(invoices_local),
+            }
+
+            invoices_local = pd.concat([invoices_local, pd.DataFrame([new_row])], ignore_index=True)
+            invoices_local = migrate_invoices(invoices_local)
+            save_all(suppliers_local, invoices_local)
+
+            # RESET ALL FIELDS TO DEFAULTS (THIS IS THE FIX)
+            for k, v in defaults.items():
+                st.session_state[k] = v
+
+            st.session_state["invoice_add_msg"] = ("success", "Invoice added successfully.")
+
+        except Exception as ex:
+            st.session_state["invoice_add_msg"] = ("error", f"Failed to add invoice: {ex}")
+
     if suppliers.empty:
         st.warning("No suppliers yet. Add supplier first.")
     else:
-        # --- Select Branch / Supplier with default "Select ..."
+        # show message
+        if st.session_state["invoice_add_msg"]:
+            kind, txt = st.session_state["invoice_add_msg"]
+            st.success(txt) if kind == "success" else st.error(txt)
+            st.session_state["invoice_add_msg"] = None
+
         c1, c2, c3 = st.columns(3)
         with c1:
             branch_options = ["Select Branch"] + branches
-            branch = st.selectbox("Branch", branch_options, index=0)
+            st.selectbox("Branch", branch_options, key="inv_branch")
         with c2:
             supplier_options = ["Select Supplier"] + suppliers["supplier_name"].astype(str).tolist()
-            supplier = st.selectbox("Supplier", supplier_options, index=0)
+            st.selectbox("Supplier", supplier_options, key="inv_supplier")
         with c3:
-            invoice_date = st.date_input("Invoice Date", value=None)
+            st.date_input("Invoice Date", value=st.session_state["inv_date"], key="inv_date")
 
         st.subheader("Invoice Amounts")
         a1, a2 = st.columns(2)
         with a1:
-            invoice_amount = st.number_input("Invoice Amount (without delivery)", min_value=0.0, step=0.01, value=0.0)
+            st.number_input("Invoice Amount (without delivery)", min_value=0.0, step=0.01, key="inv_amount")
         with a2:
-            delivery_cost = st.number_input("Delivery Cost (0 if none)", min_value=0.0, step=0.01, value=0.0)
+            st.number_input("Delivery Cost (0 if none)", min_value=0.0, step=0.01, key="del_cost")
 
         st.subheader("Payment Details (0 / partial / full / overpaid)")
         p1, p2, p3 = st.columns(3)
         with p1:
-            payment_date = st.date_input("Payment Date", value=None)
+            st.date_input("Payment Date", value=st.session_state["pay_date"], key="pay_date")
         with p2:
-            paid_cash = st.number_input("Paid Cash", min_value=0.0, step=0.01, value=0.0)
+            st.number_input("Paid Cash", min_value=0.0, step=0.01, key="paid_cash")
         with p3:
-            paid_visa = st.number_input("Paid Visa", min_value=0.0, step=0.01, value=0.0)
+            st.number_input("Paid Visa", min_value=0.0, step=0.01, key="paid_visa")
 
-        # --- validations for "Select ..." and dates
-        errors = []
-        if branch == "Select Branch":
-            errors.append("Please select a Branch.")
-        if supplier == "Select Supplier":
-            errors.append("Please select a Supplier.")
-        if invoice_date is None:
-            errors.append("Please select an Invoice Date.")
-        if (paid_cash + paid_visa) > 0 and payment_date is None:
-            errors.append("Please select a Payment Date (because paid amount > 0).")
+        st.text_input("Payment Note (optional)", key="pay_note")
 
-        total_due = float(invoice_amount + delivery_cost)
-        paid_total = float(paid_cash + paid_visa)
+        # summary card
+        total_due = float((st.session_state.get("inv_amount") or 0.0) + (st.session_state.get("del_cost") or 0.0))
+        paid_total = float((st.session_state.get("paid_cash") or 0.0) + (st.session_state.get("paid_visa") or 0.0))
         remaining = max(total_due - paid_total, 0.0)
         credit = max(paid_total - total_due, 0.0)
 
@@ -472,8 +556,6 @@ elif page == "Add Invoice":
             status = "Partial"
         else:
             status = "Unpaid"
-
-        note = st.text_input("Payment Note (optional)", value="")
 
         st.markdown(
             f"""
@@ -488,37 +570,7 @@ elif page == "Add Invoice":
             unsafe_allow_html=True,
         )
 
-        # show all errors in one place
-        for err in errors:
-            st.error(err)
-
-        if st.button("Submit Invoice"):
-            if errors:
-                st.stop()
-
-            suppliers, invoices = load_all()
-            new_row = {
-                "date": invoice_date.strftime("%Y-%m-%d"),
-                "branch": branch,
-                "supplier": supplier,
-                "invoice_amount": float(invoice_amount),
-                "delivery_cost": float(delivery_cost),
-                "total_due": float(total_due),
-                "paid_total": float(paid_total),
-                "paid_cash": float(paid_cash),
-                "paid_visa": float(paid_visa),
-                "payment_date": payment_date.strftime("%Y-%m-%d") if paid_total > 0 else "",
-                "payment_note": (note or "").strip(),
-                "remaining": float(remaining),
-                "credit": float(credit),
-                "status": status,
-                "auto_unique_id": next_invoice_id(invoices),
-            }
-            invoices = pd.concat([invoices, pd.DataFrame([new_row])], ignore_index=True)
-            invoices = migrate_invoices(invoices)
-            save_all(suppliers, invoices)
-            st.success("Invoice added.")
-            st.rerun()
+        st.button("Submit Invoice", on_click=add_invoice_callback)
 
 # =========================================================
 # View Dues
