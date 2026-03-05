@@ -359,13 +359,13 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-# Add Supplier (FIXED: use callback to clear widget key safely)
+# Add Supplier
 # =========================================================
 if "supplier_add_msg" not in st.session_state:
     st.session_state["supplier_add_msg"] = None  # ("success"|"error", "text")
 
+
 def add_supplier_callback():
-    """Runs BEFORE the script reruns. Safe place to modify st.session_state keys."""
     try:
         suppliers_local, invoices_local = load_all()
         name = (st.session_state.get("new_supplier_name", "") or "").strip()
@@ -384,17 +384,15 @@ def add_supplier_callback():
         )
         save_all(suppliers_local, invoices_local)
 
-        # Clear input so placeholder shows again
         st.session_state["new_supplier_name"] = ""
         st.session_state["supplier_add_msg"] = ("success", f"Supplier '{name}' added.")
-
     except Exception as ex:
         st.session_state["supplier_add_msg"] = ("error", f"Failed to add supplier: {ex}")
+
 
 if page == "Add Supplier":
     st.header("Add New Supplier")
 
-    # show message from previous callback run
     if st.session_state["supplier_add_msg"]:
         kind, txt = st.session_state["supplier_add_msg"]
         if kind == "success":
@@ -415,7 +413,7 @@ if page == "Add Supplier":
     st.button("Add Supplier", on_click=add_supplier_callback)
 
 # =========================================================
-# Add Invoice
+# Add Invoice (UPDATED: default Select... placeholders)
 # =========================================================
 elif page == "Add Invoice":
     st.header("Add New Invoice")
@@ -423,13 +421,16 @@ elif page == "Add Invoice":
     if suppliers.empty:
         st.warning("No suppliers yet. Add supplier first.")
     else:
+        # --- Select Branch / Supplier with default "Select ..."
         c1, c2, c3 = st.columns(3)
         with c1:
-            branch = st.selectbox("Branch", branches)
+            branch_options = ["Select Branch"] + branches
+            branch = st.selectbox("Branch", branch_options, index=0)
         with c2:
-            supplier = st.selectbox("Supplier", suppliers["supplier_name"].astype(str).tolist())
+            supplier_options = ["Select Supplier"] + suppliers["supplier_name"].astype(str).tolist()
+            supplier = st.selectbox("Supplier", supplier_options, index=0)
         with c3:
-            invoice_date = st.date_input("Invoice Date", datetime.now().date())
+            invoice_date = st.date_input("Invoice Date", value=None)
 
         st.subheader("Invoice Amounts")
         a1, a2 = st.columns(2)
@@ -438,17 +439,27 @@ elif page == "Add Invoice":
         with a2:
             delivery_cost = st.number_input("Delivery Cost (0 if none)", min_value=0.0, step=0.01, value=0.0)
 
-        total_due = float(invoice_amount + delivery_cost)
-
         st.subheader("Payment Details (0 / partial / full / overpaid)")
         p1, p2, p3 = st.columns(3)
         with p1:
-            payment_date = st.date_input("Payment Date", datetime.now().date())
+            payment_date = st.date_input("Payment Date", value=None)
         with p2:
             paid_cash = st.number_input("Paid Cash", min_value=0.0, step=0.01, value=0.0)
         with p3:
             paid_visa = st.number_input("Paid Visa", min_value=0.0, step=0.01, value=0.0)
 
+        # --- validations for "Select ..." and dates
+        errors = []
+        if branch == "Select Branch":
+            errors.append("Please select a Branch.")
+        if supplier == "Select Supplier":
+            errors.append("Please select a Supplier.")
+        if invoice_date is None:
+            errors.append("Please select an Invoice Date.")
+        if (paid_cash + paid_visa) > 0 and payment_date is None:
+            errors.append("Please select a Payment Date (because paid amount > 0).")
+
+        total_due = float(invoice_amount + delivery_cost)
         paid_total = float(paid_cash + paid_visa)
         remaining = max(total_due - paid_total, 0.0)
         credit = max(paid_total - total_due, 0.0)
@@ -477,7 +488,14 @@ elif page == "Add Invoice":
             unsafe_allow_html=True,
         )
 
+        # show all errors in one place
+        for err in errors:
+            st.error(err)
+
         if st.button("Submit Invoice"):
+            if errors:
+                st.stop()
+
             suppliers, invoices = load_all()
             new_row = {
                 "date": invoice_date.strftime("%Y-%m-%d"),
@@ -526,7 +544,7 @@ elif page == "View Dues":
     AgGrid(suppliers, gb.build(), height=450, fit_columns_on_grid_load=True)
 
 # =========================================================
-# View Invoices (selection via _select column)
+# View Invoices
 # =========================================================
 elif page == "View Invoices":
     st.header("All Invoices")
@@ -656,7 +674,6 @@ elif page == "View Invoices":
                         invoices.at[i, "paid_cash"] = float(invoices.at[i, "paid_cash"]) + needed * ratio_cash
                         invoices.at[i, "paid_visa"] = float(invoices.at[i, "paid_visa"]) + needed * ratio_visa
                         recompute_invoice_row(invoices, i)
-
                     else:
                         amt = float(add_amount)
                         invoices.at[i, "paid_cash"] = float(invoices.at[i, "paid_cash"]) + amt * ratio_cash
