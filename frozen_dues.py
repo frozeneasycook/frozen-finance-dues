@@ -310,7 +310,7 @@ def recompute_invoice_row(df: pd.DataFrame, idx: int):
 # =========================================================
 # UI
 # =========================================================
-st.set_page_config(page_title="Frozen Products Invoice Management", layout="wide")
+st.set_page_config(page_title="Frozen Supplier Invoices Management", layout="wide")
 
 st.markdown(
     f"""
@@ -343,7 +343,7 @@ h1,h2,h3,h4,h5,h6 {{ color: {BRAND_DARK_BLUE}; font-weight: 800; }}
 if os.path.exists(LOGO_PATH):
     st.image(LOGO_PATH, width=260)
 
-st.title("Frozen Products Invoice Management")
+st.title("Frozen Supplier Invoices Management")
 
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
@@ -362,7 +362,15 @@ except Exception as e:
 # =========================================================
 if page == "Add Supplier":
     st.header("Add New Supplier")
-    new_supplier = st.text_input("Supplier Name")
+
+    if "new_supplier_name" not in st.session_state:
+        st.session_state["new_supplier_name"] = ""
+
+    new_supplier = st.text_input(
+        "Supplier Name",
+        key="new_supplier_name",
+        placeholder="please add new supplier",
+    )
 
     if st.button("Add Supplier"):
         name = (new_supplier or "").strip()
@@ -376,6 +384,10 @@ if page == "Add Supplier":
                 ignore_index=True,
             )
             save_all(suppliers, invoices)
+
+            # clear input to show placeholder again
+            st.session_state["new_supplier_name"] = ""
+
             st.success(f"Supplier '{name}' added.")
             st.rerun()
 
@@ -519,7 +531,7 @@ elif page == "View Invoices":
         gb = GridOptionsBuilder.from_dataframe(display_df)
         gb.configure_default_column(editable=False, filterable=False, sortable=True)
 
-        # ✅ checkbox column (editable)
+        # checkbox column (editable)
         gb.configure_column(
             "_select",
             header_name="Select",
