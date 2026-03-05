@@ -38,11 +38,10 @@ BRAND_RED = "#ffd6d6"    # Unpaid row background
 
 # =========================================================
 # API (Google Apps Script Web App)
-# Streamlit Secrets must contain:
-#
+# Streamlit Secrets:
 # [api]
-# url = "https://script.google.com/macros/s/XXXXX/exec"
-# token = "FrozenFinance2026Key"
+# url="https://script.google.com/macros/s/.../exec"
+# token="FrozenFinance2026Key"
 # =========================================================
 def _get_api_conf():
     if "api" not in st.secrets:
@@ -60,7 +59,6 @@ def api_read(sheet_name: str, expected_cols: list[str]) -> pd.DataFrame:
         timeout=30,
     )
 
-    # If response isn't JSON, show the first chars for debugging
     text = (r.text or "").strip()
     if not text.startswith("{"):
         raise RuntimeError(f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}")
@@ -70,15 +68,13 @@ def api_read(sheet_name: str, expected_cols: list[str]) -> pd.DataFrame:
         raise RuntimeError(payload.get("error", "API error"))
 
     df = pd.DataFrame(payload.get("data", []))
-
     if df.empty:
         df = pd.DataFrame(columns=expected_cols)
 
-    # Keep ONLY the columns we expect (ignore extras like ::auto_unique_id::...)
+    # Keep only expected columns, create missing, ignore extras
     for c in expected_cols:
         if c not in df.columns:
             df[c] = ""
-
     df = df[expected_cols]
 
     return df
@@ -89,17 +85,14 @@ def api_write(sheet_name: str, df: pd.DataFrame, expected_cols: list[str]):
 
     df = df.copy()
 
-    # Keep ONLY expected columns in correct order
     for c in expected_cols:
         if c not in df.columns:
             df[c] = ""
-
     df = df[expected_cols]
 
-    # Replace NaN with empty
     df = df.where(pd.notnull(df), "")
-
     rows = df.to_dict("records")
+
     r = requests.post(
         url,
         json={"action": "write", "sheet": sheet_name, "token": token, "rows": rows},
@@ -116,35 +109,54 @@ def api_write(sheet_name: str, df: pd.DataFrame, expected_cols: list[str]):
 
 
 # =========================================================
-# LOAD / SAVE
+# DATE NORMALIZATION (FIXES BLANK DATES)
+# Handles:
+# - "2026-03-03"
+# - "1/13/2026"
+# - ISO strings with time
+# - Google/Excel serial numbers like 46035
 # =========================================================
 def _normalize_dates(series: pd.Series) -> pd.Series:
-    """
-    Robust date parsing:
-    - handles real dates, 'MM/DD/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD', and text
-    - anything unparseable becomes "" (blank)
-    """
+    if series is None or len(series) == 0:
+        return pd.Series([], dtype=str)
+
     s = series.copy()
 
-    # Convert everything to string and strip
-    s = s.astype(str).str.strip()
+    # Try numeric serial conversion (Google/Excel)
+    s_num = pd.to_numeric(s, errors="coerce")
+    serial_mask = s_num.notna() & (s_num > 20000) & (s_num < 80000)
 
-    # Convert known blanks
-    s = s.replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaT": pd.NA})
+    out_dt = pd.Series(pd.NaT, index=s.index)
 
-    # Parse with pandas inference
-    dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+    if serial_mask.any():
+        out_dt.loc[serial_mask] = pd.to_datetime(
+            s_num.loc[serial_mask],
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce",
+        )
 
-    out = dt.dt.strftime("%Y-%m-%d")
-    out = out.fillna("")
-    return out
+    # Parse the remaining as strings
+    str_mask = ~serial_mask
+    if str_mask.any():
+        s_str = s.astype(str).str.strip()
+        s_str = s_str.replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaT": pd.NA})
+        out_dt.loc[str_mask] = pd.to_datetime(
+            s_str.loc[str_mask],
+            errors="coerce",
+            infer_datetime_format=True,
+        )
+
+    return out_dt.dt.strftime("%Y-%m-%d").fillna("")
 
 
+# =========================================================
+# LOAD / SAVE
+# =========================================================
 def load_all():
     suppliers = api_read(SUPPLIERS_SHEET, SUPPLIERS_COLS)
     invoices = api_read(INVOICES_SHEET, INVOICES_COLS)
 
-    # Types
     suppliers["total_due"] = pd.to_numeric(suppliers["total_due"], errors="coerce").fillna(0.0)
 
     for c in ["full_amount", "paid_amount", "remaining"]:
@@ -153,10 +165,7 @@ def load_all():
     invoices["auto_unique_id"] = pd.to_numeric(invoices["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
 
     invoices["date"] = _normalize_dates(invoices["date"])
-
     invoices["status"] = invoices["status"].replace("", pd.NA).fillna("Unpaid")
-
-    # Ensure due isn't negative
     invoices["remaining"] = invoices["remaining"].clip(lower=0)
 
     return suppliers, invoices
@@ -180,7 +189,7 @@ def recalculate_dues_and_save(suppliers: pd.DataFrame, invoices: pd.DataFrame):
     suppliers = suppliers.copy()
     invoices = invoices.copy()
 
-    # Ensure supplier list includes any supplier name found in invoices
+    # Add missing suppliers that exist in invoices
     inv_supps = set(invoices["supplier"].dropna().astype(str).tolist())
     sup_supps = set(suppliers["supplier_name"].dropna().astype(str).tolist())
     missing = sorted(list(inv_supps - sup_supps))
@@ -197,7 +206,6 @@ def recalculate_dues_and_save(suppliers: pd.DataFrame, invoices: pd.DataFrame):
     suppliers["total_due"] = suppliers["total_due"].add(unpaid, fill_value=0).clip(lower=0)
     suppliers.reset_index(inplace=True)
 
-    # Save
     save_invoices(invoices)
     save_suppliers(suppliers)
 
@@ -283,7 +291,6 @@ st.title("Frozen Products Invoice Management")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", ["Add Supplier", "Add Invoice", "View Dues", "View Invoices"])
 
-# Load latest from Sheets
 try:
     suppliers, invoices = load_all()
 except Exception as e:
@@ -300,7 +307,6 @@ if page == "Add Supplier":
 
     if st.button("Add Supplier"):
         new_supplier = new_supplier.strip()
-
         if new_supplier == "":
             st.error("Supplier name cannot be empty.")
         elif new_supplier in suppliers["supplier_name"].astype(str).values:
@@ -323,7 +329,6 @@ elif page == "Add Invoice":
     if suppliers.empty:
         st.warning("No suppliers added yet. Please add a supplier first.")
     else:
-        # session defaults
         if "confirm_invoice_open" not in st.session_state:
             st.session_state["confirm_invoice_open"] = False
         if "pending_invoice" not in st.session_state:
@@ -357,8 +362,7 @@ elif page == "Add Invoice":
             "Amount Paid", min_value=0.0, max_value=float(full_amount), step=0.01, key="inv_paid"
         )
 
-        remaining = float(full_amount - paid_amount)
-        remaining = max(0.0, remaining)
+        remaining = max(0.0, float(full_amount - paid_amount))
 
         st.markdown(f"<div class='brand-card'><b>Remaining to Transfer:</b> {remaining:,.2f}</div>", unsafe_allow_html=True)
 
@@ -400,7 +404,6 @@ elif page == "Add Invoice":
 
                 with c_yes:
                     if st.button("✅ Yes, Submit Now"):
-                        # reload latest to reduce overwrites in multi-user use
                         suppliers, invoices = load_all()
 
                         new_invoice = pd.DataFrame(
@@ -518,135 +521,6 @@ elif page == "View Invoices":
             f"<div class='brand-card'><b>Filtered Total Remaining:</b> {filtered_remaining_sum:,.2f}</div>",
             unsafe_allow_html=True,
         )
-
-        selected_rows = normalize_selected_rows(grid_response)
-        st.markdown("<div class='brand-card'><b>Tip:</b> Select invoices using the checkbox to enable actions.</div>", unsafe_allow_html=True)
-
-        if len(selected_rows) > 0:
-            st.success(f"Selected {len(selected_rows)} invoice(s)")
-
-            colA, colB, colC = st.columns(3)
-
-            with colA:
-                if st.button("Toggle Status"):
-                    # reload latest before write
-                    suppliers, invoices = load_all()
-
-                    ids = [int(r["auto_unique_id"]) for r in selected_rows if "auto_unique_id" in r]
-                    mask = invoices["auto_unique_id"].isin(ids)
-
-                    invoices.loc[mask, "status"] = invoices.loc[mask, "status"].apply(
-                        lambda s: "Paid" if s == "Unpaid" else "Unpaid"
-                    )
-
-                    # If Paid -> remaining = 0
-                    paid_mask = mask & (invoices["status"] == "Paid")
-                    invoices.loc[paid_mask, "remaining"] = 0.0
-
-                    suppliers, invoices = recalculate_dues_and_save(suppliers, invoices)
-                    st.rerun()
-
-            with colB:
-                if st.button("Add Partial Payment"):
-                    st.session_state["partial_payment_open"] = True
-
-            with colC:
-                if st.button("Delete Selected"):
-                    st.session_state["delete_confirm_open"] = True
-
-        # Partial Payment
-        if st.session_state.get("partial_payment_open", False):
-            with st.container(border=True):
-                st.subheader("Partial Payment")
-                st.write("This will ADD to paid amount, and reduce remaining.")
-
-                ids = [int(r["auto_unique_id"]) for r in selected_rows if "auto_unique_id" in r]
-                if not ids:
-                    st.warning("No valid selection.")
-                else:
-                    payment = st.number_input("Payment amount to apply", min_value=0.0, step=0.01)
-
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Apply Payment"):
-                            if payment <= 0:
-                                st.error("Payment must be greater than 0.")
-                            else:
-                                suppliers, invoices = load_all()
-
-                                sel_df = invoices[invoices["auto_unique_id"].isin(ids)].copy()
-                                # Sort by date (blank dates go last)
-                                sel_df["_date_sort"] = pd.to_datetime(sel_df["date"], errors="coerce")
-                                sel_df = sel_df.sort_values("_date_sort").drop(columns=["_date_sort"])
-
-                                remaining_payment = float(payment)
-
-                                for _, row in sel_df.iterrows():
-                                    if remaining_payment <= 0:
-                                        break
-
-                                    inv_id = int(row["auto_unique_id"])
-                                    current_remaining = float(row["remaining"])
-
-                                    if current_remaining <= 0:
-                                        invoices.loc[invoices["auto_unique_id"] == inv_id, "status"] = "Paid"
-                                        invoices.loc[invoices["auto_unique_id"] == inv_id, "remaining"] = 0.0
-                                        continue
-
-                                    pay_here = min(current_remaining, remaining_payment)
-
-                                    invoices.loc[invoices["auto_unique_id"] == inv_id, "paid_amount"] = (
-                                        float(invoices.loc[invoices["auto_unique_id"] == inv_id, "paid_amount"].values[0]) + pay_here
-                                    )
-
-                                    invoices.loc[invoices["auto_unique_id"] == inv_id, "remaining"] = (
-                                        float(invoices.loc[invoices["auto_unique_id"] == inv_id, "remaining"].values[0]) - pay_here
-                                    )
-
-                                    new_rem = float(invoices.loc[invoices["auto_unique_id"] == inv_id, "remaining"].values[0])
-                                    if new_rem <= 0.00001:
-                                        invoices.loc[invoices["auto_unique_id"] == inv_id, "remaining"] = 0.0
-                                        invoices.loc[invoices["auto_unique_id"] == inv_id, "status"] = "Paid"
-                                    else:
-                                        invoices.loc[invoices["auto_unique_id"] == inv_id, "status"] = "Unpaid"
-
-                                    remaining_payment -= pay_here
-
-                                suppliers, invoices = recalculate_dues_and_save(suppliers, invoices)
-                                st.session_state["partial_payment_open"] = False
-                                st.success("Payment applied successfully.")
-                                st.rerun()
-
-                    with c2:
-                        if st.button("Cancel"):
-                            st.session_state["partial_payment_open"] = False
-                            st.rerun()
-
-        # Delete Selected
-        if st.session_state.get("delete_confirm_open", False):
-            with st.container(border=True):
-                st.subheader("Confirm Delete")
-                st.warning("This action cannot be undone.")
-
-                ids = [int(r["auto_unique_id"]) for r in selected_rows if "auto_unique_id" in r]
-                st.write(f"Invoices to delete: {len(ids)}")
-
-                d1, d2 = st.columns(2)
-                with d1:
-                    if st.button("✅ Yes, Delete Now"):
-                        suppliers, invoices = load_all()
-
-                        invoices = invoices[~invoices["auto_unique_id"].isin(ids)].reset_index(drop=True)
-                        suppliers, invoices = recalculate_dues_and_save(suppliers, invoices)
-
-                        st.session_state["delete_confirm_open"] = False
-                        st.success("Deleted successfully.")
-                        st.rerun()
-
-                with d2:
-                    if st.button("❌ Cancel"):
-                        st.session_state["delete_confirm_open"] = False
-                        st.rerun()
 
         # Download invoices
         buffer = io.BytesIO()
