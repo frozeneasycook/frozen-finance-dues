@@ -15,7 +15,16 @@ SUPPLIERS_SHEET = "suppliers"
 INVOICES_SHEET = "invoices"
 
 SUPPLIERS_COLS = ["supplier_name", "total_due"]
-INVOICES_COLS = ["date", "branch", "supplier", "full_amount", "paid_amount", "remaining", "status", "auto_unique_id"]
+INVOICES_COLS = [
+    "date",
+    "branch",
+    "supplier",
+    "full_amount",
+    "paid_amount",
+    "remaining",
+    "status",
+    "auto_unique_id",
+]
 
 branches = [
     "Frozen Obour",
@@ -38,10 +47,11 @@ BRAND_RED = "#ffd6d6"    # Unpaid row background
 
 # =========================================================
 # API (Google Apps Script Web App)
-# Streamlit Secrets:
+# Streamlit Secrets must contain:
+#
 # [api]
-# url="https://script.google.com/macros/s/.../exec"
-# token="FrozenFinance2026Key"
+# url = "https://script.google.com/macros/s/XXXXX/exec"
+# token = "FrozenFinance2026Key"
 # =========================================================
 def _get_api_conf():
     if "api" not in st.secrets:
@@ -53,6 +63,7 @@ def _get_api_conf():
 
 def api_read(sheet_name: str, expected_cols: list[str]) -> pd.DataFrame:
     url, token = _get_api_conf()
+
     r = requests.get(
         url,
         params={"action": "read", "sheet": sheet_name, "token": token},
@@ -61,7 +72,9 @@ def api_read(sheet_name: str, expected_cols: list[str]) -> pd.DataFrame:
 
     text = (r.text or "").strip()
     if not text.startswith("{"):
-        raise RuntimeError(f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}")
+        raise RuntimeError(
+            f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}"
+        )
 
     payload = r.json()
     if not payload.get("ok"):
@@ -71,7 +84,7 @@ def api_read(sheet_name: str, expected_cols: list[str]) -> pd.DataFrame:
     if df.empty:
         df = pd.DataFrame(columns=expected_cols)
 
-    # Keep only expected columns, create missing, ignore extras
+    # Keep ONLY expected columns (ignore extras like ::auto_unique_id::...)
     for c in expected_cols:
         if c not in df.columns:
             df[c] = ""
@@ -85,14 +98,16 @@ def api_write(sheet_name: str, df: pd.DataFrame, expected_cols: list[str]):
 
     df = df.copy()
 
+    # Keep ONLY expected columns in correct order
     for c in expected_cols:
         if c not in df.columns:
             df[c] = ""
     df = df[expected_cols]
 
+    # Replace NaN with empty
     df = df.where(pd.notnull(df), "")
-    rows = df.to_dict("records")
 
+    rows = df.to_dict("records")
     r = requests.post(
         url,
         json={"action": "write", "sheet": sheet_name, "token": token, "rows": rows},
@@ -101,7 +116,9 @@ def api_write(sheet_name: str, df: pd.DataFrame, expected_cols: list[str]):
 
     text = (r.text or "").strip()
     if not text.startswith("{"):
-        raise RuntimeError(f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}")
+        raise RuntimeError(
+            f"API did not return JSON. Status={r.status_code}. First 200 chars: {text[:200]}"
+        )
 
     payload = r.json()
     if not payload.get("ok"):
@@ -109,25 +126,32 @@ def api_write(sheet_name: str, df: pd.DataFrame, expected_cols: list[str]):
 
 
 # =========================================================
-# DATE NORMALIZATION (FIXES BLANK DATES)
+# DATE NORMALIZATION (FIXED .dt ERROR + BLANK DATES)
 # Handles:
-# - "2026-03-03"
-# - "1/13/2026"
-# - ISO strings with time
-# - Google/Excel serial numbers like 46035
+# - '2026-03-03'
+# - '1/13/2026'
+# - serial numbers (Excel/Sheets) like 46035
+# - blanks
 # =========================================================
 def _normalize_dates(series: pd.Series) -> pd.Series:
-    if series is None or len(series) == 0:
+    """
+    Robust date parsing that ALWAYS returns YYYY-MM-DD strings.
+    Prevents: "Can only use .dt accessor with datetimelike values"
+    """
+    if series is None:
         return pd.Series([], dtype=str)
 
     s = series.copy()
 
-    # Try numeric serial conversion (Google/Excel)
+    if len(s) == 0:
+        return pd.Series([], dtype=str)
+
+    # Force datetime dtype from start (prevents .dt crash)
+    out_dt = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    # 1) Numeric serial conversion (Excel/Sheets serial days)
     s_num = pd.to_numeric(s, errors="coerce")
     serial_mask = s_num.notna() & (s_num > 20000) & (s_num < 80000)
-
-    out_dt = pd.Series(pd.NaT, index=s.index)
-
     if serial_mask.any():
         out_dt.loc[serial_mask] = pd.to_datetime(
             s_num.loc[serial_mask],
@@ -136,7 +160,7 @@ def _normalize_dates(series: pd.Series) -> pd.Series:
             errors="coerce",
         )
 
-    # Parse the remaining as strings
+    # 2) Parse remaining as strings
     str_mask = ~serial_mask
     if str_mask.any():
         s_str = s.astype(str).str.strip()
@@ -157,15 +181,23 @@ def load_all():
     suppliers = api_read(SUPPLIERS_SHEET, SUPPLIERS_COLS)
     invoices = api_read(INVOICES_SHEET, INVOICES_COLS)
 
-    suppliers["total_due"] = pd.to_numeric(suppliers["total_due"], errors="coerce").fillna(0.0)
+    # Types
+    suppliers["total_due"] = pd.to_numeric(
+        suppliers["total_due"], errors="coerce"
+    ).fillna(0.0)
 
     for c in ["full_amount", "paid_amount", "remaining"]:
         invoices[c] = pd.to_numeric(invoices[c], errors="coerce").fillna(0.0)
 
-    invoices["auto_unique_id"] = pd.to_numeric(invoices["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
+    invoices["auto_unique_id"] = pd.to_numeric(
+        invoices["auto_unique_id"], errors="coerce"
+    ).fillna(-1).astype(int)
 
     invoices["date"] = _normalize_dates(invoices["date"])
+
     invoices["status"] = invoices["status"].replace("", pd.NA).fillna("Unpaid")
+
+    # Ensure remaining isn't negative
     invoices["remaining"] = invoices["remaining"].clip(lower=0)
 
     return suppliers, invoices
@@ -189,13 +221,16 @@ def recalculate_dues_and_save(suppliers: pd.DataFrame, invoices: pd.DataFrame):
     suppliers = suppliers.copy()
     invoices = invoices.copy()
 
-    # Add missing suppliers that exist in invoices
+    # Ensure supplier list includes any supplier name found in invoices
     inv_supps = set(invoices["supplier"].dropna().astype(str).tolist())
     sup_supps = set(suppliers["supplier_name"].dropna().astype(str).tolist())
     missing = sorted(list(inv_supps - sup_supps))
     if missing:
         suppliers = pd.concat(
-            [suppliers, pd.DataFrame({"supplier_name": missing, "total_due": [0.0] * len(missing)})],
+            [
+                suppliers,
+                pd.DataFrame({"supplier_name": missing, "total_due": [0.0] * len(missing)}),
+            ],
             ignore_index=True,
         )
 
@@ -206,6 +241,7 @@ def recalculate_dues_and_save(suppliers: pd.DataFrame, invoices: pd.DataFrame):
     suppliers["total_due"] = suppliers["total_due"].add(unpaid, fill_value=0).clip(lower=0)
     suppliers.reset_index(inplace=True)
 
+    # Save
     save_invoices(invoices)
     save_suppliers(suppliers)
 
@@ -291,6 +327,7 @@ st.title("Frozen Products Invoice Management")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", ["Add Supplier", "Add Invoice", "View Dues", "View Invoices"])
 
+# Load latest from Sheets
 try:
     suppliers, invoices = load_all()
 except Exception as e:
@@ -307,6 +344,7 @@ if page == "Add Supplier":
 
     if st.button("Add Supplier"):
         new_supplier = new_supplier.strip()
+
         if new_supplier == "":
             st.error("Supplier name cannot be empty.")
         elif new_supplier in suppliers["supplier_name"].astype(str).values:
@@ -329,6 +367,7 @@ elif page == "Add Invoice":
     if suppliers.empty:
         st.warning("No suppliers added yet. Please add a supplier first.")
     else:
+        # session defaults
         if "confirm_invoice_open" not in st.session_state:
             st.session_state["confirm_invoice_open"] = False
         if "pending_invoice" not in st.session_state:
@@ -364,7 +403,10 @@ elif page == "Add Invoice":
 
         remaining = max(0.0, float(full_amount - paid_amount))
 
-        st.markdown(f"<div class='brand-card'><b>Remaining to Transfer:</b> {remaining:,.2f}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='brand-card'><b>Remaining to Transfer:</b> {remaining:,.2f}</div>",
+            unsafe_allow_html=True,
+        )
 
         if st.button("Submit Invoice"):
             if full_amount <= 0:
@@ -404,6 +446,7 @@ elif page == "Add Invoice":
 
                 with c_yes:
                     if st.button("✅ Yes, Submit Now"):
+                        # reload latest to reduce overwrites in multi-user use
                         suppliers, invoices = load_all()
 
                         new_invoice = pd.DataFrame(
@@ -447,7 +490,10 @@ elif page == "View Dues":
         st.info("No suppliers yet.")
     else:
         total_dues_sum = float(pd.to_numeric(suppliers["total_due"], errors="coerce").fillna(0).sum())
-        st.markdown(f"<div class='brand-card'><b>Total Due (All Suppliers):</b> {total_dues_sum:,.2f}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='brand-card'><b>Total Due (All Suppliers):</b> {total_dues_sum:,.2f}</div>",
+            unsafe_allow_html=True,
+        )
 
         gb = GridOptionsBuilder.from_dataframe(suppliers)
         gb.configure_default_column(editable=False, filterable=True, sortable=True)
@@ -455,7 +501,7 @@ elif page == "View Dues":
         gb.configure_column("total_due", type=["numericColumn"], valueFormatter="data.total_due.toFixed(2)")
         grid_options = gb.build()
 
-        AgGrid(suppliers, grid_options, height=400, fit_columns_on_grid_load=True)
+        AgGrid(suppliers, grid_options, height=420, fit_columns_on_grid_load=True)
 
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
