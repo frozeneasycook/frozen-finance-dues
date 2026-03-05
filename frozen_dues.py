@@ -2,14 +2,13 @@ import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime, date
-from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode, DataReturnMode
 import requests
 
 # =========================================================
 # CONFIG
 # =========================================================
 LOGO_PATH = "logo.png"
-RESET_PASSWORD = "c12q7mgh"   # used for Reset + Delete actions
+RESET_PASSWORD = "c12q7mgh"
 
 SUPPLIERS_SHEET = "suppliers"
 INVOICES_SHEET = "invoices"
@@ -25,7 +24,7 @@ INVOICES_COLS = [
     "total_due",
     "paid_total",
     "paid_cash",
-    "paid_visa",          # kept as-is in sheet; UI label shows "Bank"
+    "paid_visa",          # keep stored as "paid_visa" but UI calls it "Bank"
     "payment_date",
     "payment_note",
     "remaining",
@@ -50,9 +49,6 @@ BRAND_DARK_BLUE = "#001f3f"
 BRAND_LIGHT_BLUE = "#ADD8E6"
 BRAND_YELLOW = "#FFDC00"
 BRAND_WHITE = "#FFFFFF"
-BRAND_GREEN = "#c8f7c5"
-BRAND_RED = "#ffd6d6"
-BRAND_AMBER = "#fff2cc"
 
 # =========================================================
 # API (Google Apps Script Web App)
@@ -266,21 +262,6 @@ def recalc_supplier_balances(suppliers: pd.DataFrame, invoices: pd.DataFrame) ->
     return ensure_columns(suppliers, SUPPLIERS_COLS)
 
 
-def load_all():
-    raw_suppliers = api_read(SUPPLIERS_SHEET)
-    raw_invoices = api_read(INVOICES_SHEET)
-    suppliers = migrate_suppliers(raw_suppliers)
-    invoices = migrate_invoices(raw_invoices)
-    suppliers = recalc_supplier_balances(suppliers, invoices)
-    return suppliers, invoices
-
-
-def save_all(suppliers: pd.DataFrame, invoices: pd.DataFrame):
-    suppliers = recalc_supplier_balances(suppliers, invoices)
-    api_write(INVOICES_SHEET, ensure_columns(invoices, INVOICES_COLS))
-    api_write(SUPPLIERS_SHEET, ensure_columns(suppliers, SUPPLIERS_COLS))
-
-
 def recompute_invoice_row(df: pd.DataFrame, idx: int):
     df.at[idx, "date"] = _to_yyyy_mm_dd(df.at[idx, "date"])
     df.at[idx, "payment_date"] = _to_yyyy_mm_dd(df.at[idx, "payment_date"])
@@ -306,6 +287,30 @@ def recompute_invoice_row(df: pd.DataFrame, idx: int):
 
 
 # =========================================================
+# FAST LOAD (CACHE) + SAVE
+# =========================================================
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_load_all():
+    raw_suppliers = api_read(SUPPLIERS_SHEET)
+    raw_invoices = api_read(INVOICES_SHEET)
+    suppliers = migrate_suppliers(raw_suppliers)
+    invoices = migrate_invoices(raw_invoices)
+    suppliers = recalc_supplier_balances(suppliers, invoices)
+    return suppliers, invoices
+
+
+def load_all():
+    return _cached_load_all()
+
+
+def save_all(suppliers: pd.DataFrame, invoices: pd.DataFrame):
+    suppliers = recalc_supplier_balances(suppliers, invoices)
+    api_write(INVOICES_SHEET, ensure_columns(invoices, INVOICES_COLS))
+    api_write(SUPPLIERS_SHEET, ensure_columns(suppliers, SUPPLIERS_COLS))
+    _cached_load_all.clear()  # refresh cache after write
+
+
+# =========================================================
 # UI
 # =========================================================
 st.set_page_config(page_title="Frozen Supplier Invoices Management", layout="wide")
@@ -325,7 +330,6 @@ h1,h2,h3,h4,h5,h6 {{ color: {BRAND_DARK_BLUE}; font-weight: 800; }}
     font-weight: 800;
     padding: 0.55rem 1rem;
 }}
-.stButton > button:hover {{ filter: brightness(0.95); transform: translateY(-1px); }}
 .brand-card {{
     background: rgba(255,255,255,0.55);
     border: 1px solid rgba(0,0,0,0.06);
@@ -393,31 +397,23 @@ if page == "Add Supplier":
 
     if st.session_state["supplier_add_msg"]:
         kind, txt = st.session_state["supplier_add_msg"]
-        if kind == "success":
-            st.success(txt)
-        else:
-            st.error(txt)
+        (st.success if kind == "success" else st.error)(txt)
         st.session_state["supplier_add_msg"] = None
 
     if "new_supplier_name" not in st.session_state:
         st.session_state["new_supplier_name"] = ""
 
-    st.text_input(
-        "Supplier Name",
-        key="new_supplier_name",
-        placeholder="please add new supplier",
-    )
-
+    st.text_input("Supplier Name", key="new_supplier_name", placeholder="please add new supplier")
     st.button("Add Supplier", on_click=add_supplier_callback)
 
 # =========================================================
-# Add Invoice (RESET TO DEFAULT AFTER SUBMIT)
+# Add Invoice
 # =========================================================
 elif page == "Add Invoice":
     st.header("Add New Invoice")
 
     if "invoice_add_msg" not in st.session_state:
-        st.session_state["invoice_add_msg"] = None  # ("success"|"error", "text")
+        st.session_state["invoice_add_msg"] = None
 
     defaults = {
         "inv_branch": "Select Branch",
@@ -512,10 +508,7 @@ elif page == "Add Invoice":
     else:
         if st.session_state["invoice_add_msg"]:
             kind, txt = st.session_state["invoice_add_msg"]
-            if kind == "success":
-                st.success(txt)
-            else:
-                st.error(txt)
+            (st.success if kind == "success" else st.error)(txt)
             st.session_state["invoice_add_msg"] = None
 
         c1, c2, c3 = st.columns(3)
@@ -576,10 +569,11 @@ elif page == "Add Invoice":
         st.button("Submit Invoice", on_click=add_invoice_callback)
 
 # =========================================================
-# View Dues
+# View Dues (MOBILE FRIENDLY)
 # =========================================================
 elif page == "View Dues":
     st.header("Supplier Dues")
+
     total_due_sum = float(pd.to_numeric(suppliers["total_due"], errors="coerce").fillna(0.0).sum())
     total_credit_sum = float(pd.to_numeric(suppliers["credit_balance"], errors="coerce").fillna(0.0).sum())
 
@@ -593,19 +587,19 @@ elif page == "View Dues":
         unsafe_allow_html=True,
     )
 
-    gb = GridOptionsBuilder.from_dataframe(suppliers)
-    gb.configure_default_column(editable=False, filterable=True, sortable=True, resizable=False)
-    gb.configure_column("supplier_name", filter="agTextColumnFilter")
-    AgGrid(
+    st.dataframe(
         suppliers,
-        gb.build(),
-        height=450,
-        fit_columns_on_grid_load=False,
-        update_mode=GridUpdateMode.NO_UPDATE,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "supplier_name": st.column_config.TextColumn("Supplier", width="medium"),
+            "total_due": st.column_config.NumberColumn("Total Due", format="%.2f", width="small"),
+            "credit_balance": st.column_config.NumberColumn("Credit", format="%.2f", width="small"),
+        },
     )
 
 # =========================================================
-# View Invoices
+# View Invoices (MOBILE FRIENDLY, FAST)
 # =========================================================
 elif page == "View Invoices":
     st.header("All Invoices")
@@ -613,104 +607,83 @@ elif page == "View Invoices":
     if invoices.empty:
         st.info("No invoices yet.")
     else:
-        row_style = JsCode(
-            f"""
-            function(params) {{
-                if (!params || !params.data) return null;
-                if (params.data.status === 'Paid') return {{ 'backgroundColor': '{BRAND_GREEN}' }};
-                if (params.data.status === 'Credit') return {{ 'backgroundColor': '{BRAND_AMBER}' }};
-                if (params.data.status === 'Partial' || params.data.status === 'Unpaid') return {{ 'backgroundColor': '{BRAND_RED}' }};
-                return null;
-            }}
-            """
-        )
+        # ---------- Filters (native) ----------
+        f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 1.2])
+        with f1:
+            branch_filter = st.selectbox("Branch", ["All"] + branches, index=0)
+        with f2:
+            supplier_filter = st.selectbox("Supplier", ["All"] + sorted(invoices["supplier"].astype(str).unique().tolist()), index=0)
+        with f3:
+            status_filter = st.selectbox("Status", ["All", "Unpaid", "Partial", "Paid", "Credit"], index=0)
+        with f4:
+            date_mode = st.selectbox("Date Filter", ["All", "Between"], index=0)
 
-        # Auto-size columns to content/header (and LOCK layout: no move, no resize)
-        on_grid_ready = JsCode(
-            """
-            function(params) {
-                setTimeout(function() {
-                    try {
-                        var allCols = [];
-                        params.columnApi.getAllColumns().forEach(function(col) {
-                            allCols.push(col.getId());
-                        });
-                        params.columnApi.autoSizeColumns(allCols, false);
-                    } catch(e) {}
-                }, 50);
-            }
-            """
-        )
+        start_d, end_d = None, None
+        if date_mode == "Between":
+            d1, d2 = st.columns(2)
+            with d1:
+                start_d = st.date_input("From", value=date.today())
+            with d2:
+                end_d = st.date_input("To", value=date.today())
 
-        display_df = invoices.copy()
-        display_df.insert(0, "_select", False)
+        df = invoices.copy()
+        df["date"] = df["date"].astype(str)
+        df["payment_date"] = df["payment_date"].astype(str)
 
-        gb = GridOptionsBuilder.from_dataframe(display_df)
+        if branch_filter != "All":
+            df = df[df["branch"] == branch_filter]
+        if supplier_filter != "All":
+            df = df[df["supplier"] == supplier_filter]
+        if status_filter != "All":
+            df = df[df["status"] == status_filter]
 
-        # Default: non-editable, allow sorting; lock moving/resizing
-        gb.configure_default_column(
-            editable=False,
-            filterable=False,
-            sortable=True,
-            resizable=False,
-            suppressMovable=True,
-        )
+        if date_mode == "Between" and start_d and end_d:
+            # compare strings YYYY-MM-DD (safe if normalized)
+            s = start_d.strftime("%Y-%m-%d")
+            e = end_d.strftime("%Y-%m-%d")
+            df = df[(df["date"] >= s) & (df["date"] <= e)]
 
-        gb.configure_column(
-            "_select",
-            header_name="Select",
-            editable=True,
-            width=90,
-            cellRenderer="agCheckboxCellRenderer",
-            pinned="left",
-            resizable=False,
-            suppressMovable=True,
-        )
-
-        # Only these filters
-        gb.configure_column("date", header_name="Invoice Date", filter="agTextColumnFilter", filterable=True, resizable=False, suppressMovable=True)
-        gb.configure_column("branch", filter="agTextColumnFilter", filterable=True, resizable=False, suppressMovable=True)
-        gb.configure_column("supplier", filter="agTextColumnFilter", filterable=True, resizable=False, suppressMovable=True)
-        gb.configure_column("status", filter="agTextColumnFilter", filterable=True, resizable=False, suppressMovable=True)
-
-        # Hide internal id
-        gb.configure_column("auto_unique_id", hide=True)
-
-        grid_options = gb.build()
-        grid_options["getRowStyle"] = row_style
-        grid_options["onGridReady"] = on_grid_ready
-
-        # Strong locks (no drag/drop columns, no resizing)
-        grid_options["suppressMovableColumns"] = True
-        grid_options["suppressDragLeaveHidesColumns"] = True
-        grid_options["suppressColumnMoveAnimation"] = True
-
-        grid_response = AgGrid(
-            display_df,
-            gridOptions=grid_options,
-            height=520,
-            fit_columns_on_grid_load=False,  # IMPORTANT: don't force fit-to-screen
-            update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED,
-            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            allow_unsafe_jscode=True,
-        )
-
-        grid_data = pd.DataFrame(grid_response.get("data", display_df.to_dict("records")))
-        if "_select" not in grid_data.columns:
-            grid_data["_select"] = False
-
-        selected = grid_data[grid_data["_select"] == True].copy()
-
-        filtered_remaining_sum = float(pd.to_numeric(grid_data.get("remaining", 0), errors="coerce").fillna(0).sum())
+        filtered_remaining_sum = float(pd.to_numeric(df.get("remaining", 0), errors="coerce").fillna(0).sum())
         st.markdown(
             f"<div class='brand-card'><b>Filtered Total Remaining:</b> {filtered_remaining_sum:,.2f}</div>",
             unsafe_allow_html=True,
         )
 
-        st.subheader("Actions (tick Select checkbox in rows above)")
+        # ---------- Selection table (checkbox) ----------
+        view = df.copy()
+        view.insert(0, "Select", False)
 
+        # Prevent edits except checkbox: we will ignore any other edits anyway by disabling columns
+        disabled_cols = [c for c in view.columns if c != "Select"]
+
+        edited = st.data_editor(
+            view,
+            use_container_width=True,
+            hide_index=True,
+            disabled=disabled_cols,
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select", width="small"),
+                "date": st.column_config.TextColumn("Invoice Date", width="small"),
+                "branch": st.column_config.TextColumn("Branch", width="medium"),
+                "supplier": st.column_config.TextColumn("Supplier", width="medium"),
+                "invoice_amount": st.column_config.NumberColumn("Invoice Amount", format="%.2f", width="small"),
+                "delivery_cost": st.column_config.NumberColumn("Delivery", format="%.2f", width="small"),
+                "total_due": st.column_config.NumberColumn("Total Due", format="%.2f", width="small"),
+                "paid_total": st.column_config.NumberColumn("Paid Total", format="%.2f", width="small"),
+                "paid_cash": st.column_config.NumberColumn("Paid Cash", format="%.2f", width="small"),
+                "paid_visa": st.column_config.NumberColumn("Paid Bank", format="%.2f", width="small"),
+                "payment_date": st.column_config.TextColumn("Payment Date", width="small"),
+                "payment_note": st.column_config.TextColumn("Note", width="large"),
+                "remaining": st.column_config.NumberColumn("Remaining", format="%.2f", width="small"),
+                "credit": st.column_config.NumberColumn("Credit", format="%.2f", width="small"),
+                "status": st.column_config.TextColumn("Status", width="small"),
+                "auto_unique_id": st.column_config.NumberColumn("ID", width="small"),
+            },
+        )
+
+        selected = edited[edited["Select"] == True].copy()
         if selected.empty:
-            st.info("Tick the Select checkbox for one or more invoices above.")
+            st.info("Select one or more invoices using the checkbox.")
         else:
             selected_ids = sorted(pd.to_numeric(selected["auto_unique_id"], errors="coerce").fillna(-1).astype(int).tolist())
             st.markdown(
@@ -718,35 +691,20 @@ elif page == "View Invoices":
                 unsafe_allow_html=True,
             )
 
-            action = st.radio(
-                "Choose action",
-                ["Full Pay", "Partial Pay", "Delete Invoice(s)"],
-            )
+            st.subheader("Actions")
+            action = st.radio("Choose action", ["Full Pay", "Partial Pay", "Delete Invoice(s)"], horizontal=True)
 
-            # Shared fields
-            pay_date = st.date_input("Payment Date", datetime.now().date(), key="bulk_pay_date")
-
-            method = st.selectbox(
-                "Payment Method",
-                ["Bank", "Cash", "Cash + Bank"],
-                index=0,  # default Bank
-            )
-
+            pay_date = st.date_input("Payment Date", datetime.now().date(), key="mobile_pay_date")
+            method = st.selectbox("Payment Method", ["Bank", "Cash", "Cash + Bank"], index=0)
             note = st.text_input("Payment Note (optional)", value="")
 
-            # Amount inputs:
             cash_amt = 0.0
             bank_amt = 0.0
             total_amt = 0.0
 
             if action in ["Full Pay", "Partial Pay"]:
                 if method in ["Bank", "Cash"]:
-                    total_amt = st.number_input(
-                        "Amount",
-                        min_value=0.0,
-                        step=0.01,
-                        value=0.0 if action == "Partial Pay" else 0.0,
-                    )
+                    total_amt = st.number_input("Amount", min_value=0.0, step=0.01, value=0.0)
                 else:
                     c1, c2 = st.columns(2)
                     with c1:
@@ -755,25 +713,23 @@ elif page == "View Invoices":
                         bank_amt = st.number_input("Bank Amount", min_value=0.0, step=0.01, value=0.0)
                     total_amt = float(cash_amt + bank_amt)
 
-            # Delete password
             del_pw = ""
             if action == "Delete Invoice(s)":
-                del_pw = st.text_input("Enter password to delete selected invoices", type="password")
+                del_pw = st.text_input("Enter password to delete", type="password")
 
-            def _apply_payment_to_invoice(df: pd.DataFrame, idx: int, add_cash: float, add_bank: float, pdate: date, pnote: str):
-                df.at[idx, "paid_cash"] = float(pd.to_numeric(df.at[idx, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
-                df.at[idx, "paid_visa"] = float(pd.to_numeric(df.at[idx, "paid_visa"], errors="coerce") or 0.0) + float(add_bank)
-                df.at[idx, "payment_date"] = pdate.strftime("%Y-%m-%d")
+            def _apply_payment_to_invoice(df_local: pd.DataFrame, idx: int, add_cash: float, add_bank: float, pdate: date, pnote: str):
+                df_local.at[idx, "paid_cash"] = float(pd.to_numeric(df_local.at[idx, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
+                df_local.at[idx, "paid_visa"] = float(pd.to_numeric(df_local.at[idx, "paid_visa"], errors="coerce") or 0.0) + float(add_bank)
+                df_local.at[idx, "payment_date"] = pdate.strftime("%Y-%m-%d")
                 if (pnote or "").strip():
-                    df.at[idx, "payment_note"] = (pnote or "").strip()
-                recompute_invoice_row(df, idx)
+                    df_local.at[idx, "payment_note"] = (pnote or "").strip()
+                recompute_invoice_row(df_local, idx)
 
-            if st.button("APPLY"):
+            if st.button("APPLY", use_container_width=True):
                 suppliers_local, invoices_local = load_all()
                 invoices_local["auto_unique_id"] = pd.to_numeric(invoices_local["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
                 id_to_idx = {int(invoices_local.at[i, "auto_unique_id"]): i for i in invoices_local.index}
 
-                # DELETE
                 if action == "Delete Invoice(s)":
                     if del_pw != RESET_PASSWORD:
                         st.error("Wrong password.")
@@ -793,7 +749,6 @@ elif page == "View Invoices":
                         continue
                     i = id_to_idx[inv_id]
 
-                    # normalize numeric fields first
                     for c in ["paid_cash", "paid_visa", "invoice_amount", "delivery_cost", "paid_total", "total_due"]:
                         invoices_local.at[i, c] = float(pd.to_numeric(invoices_local.at[i, c], errors="coerce") or 0.0)
 
@@ -801,24 +756,21 @@ elif page == "View Invoices":
                     needed = max(float(invoices_local.at[i, "total_due"]) - float(invoices_local.at[i, "paid_total"]), 0.0)
 
                     if action == "Full Pay":
-                        # For full pay: amount must settle exactly if Cash+Bank (to avoid confusion)
                         if method == "Bank":
                             add_cash, add_bank = 0.0, float(needed)
                         elif method == "Cash":
                             add_cash, add_bank = float(needed), 0.0
                         else:
-                            # user entered cash_amt + bank_amt
                             if abs(float(total_amt) - float(needed)) > 0.01:
-                                st.error(f"Cash + Bank must equal the remaining amount for FULL PAY. Remaining for invoice {inv_id} = {needed:,.2f}")
+                                st.error(f"Cash + Bank must equal remaining for FULL PAY. Invoice {inv_id} remaining = {needed:,.2f}")
                                 st.stop()
                             add_cash, add_bank = float(cash_amt), float(bank_amt)
 
                         _apply_payment_to_invoice(invoices_local, i, add_cash, add_bank, pay_date, note)
                         updated += 1
-
-                    else:  # Partial Pay
+                    else:
                         if float(total_amt) <= 0:
-                            st.error("Partial Pay amount must be greater than 0.")
+                            st.error("Partial Pay amount must be > 0.")
                             st.stop()
 
                         if method == "Bank":
@@ -826,7 +778,6 @@ elif page == "View Invoices":
                         elif method == "Cash":
                             add_cash, add_bank = float(total_amt), 0.0
                         else:
-                            # amounts already split
                             add_cash, add_bank = float(cash_amt), float(bank_amt)
 
                         _apply_payment_to_invoice(invoices_local, i, add_cash, add_bank, pay_date, note)
@@ -847,7 +798,7 @@ elif page == "Reset (Admin)":
     pw = st.text_input("Enter password to enable reset", type="password")
     confirm = st.checkbox("I understand this will delete all data")
 
-    if st.button("RESET NOW"):
+    if st.button("RESET NOW", use_container_width=True):
         if pw != RESET_PASSWORD:
             st.error("Wrong password.")
             st.stop()
@@ -857,5 +808,6 @@ elif page == "Reset (Admin)":
 
         api_write(SUPPLIERS_SHEET, pd.DataFrame(columns=SUPPLIERS_COLS))
         api_write(INVOICES_SHEET, pd.DataFrame(columns=INVOICES_COLS))
+        _cached_load_all.clear()
         st.success("Reset completed. Reloading...")
         st.rerun()
