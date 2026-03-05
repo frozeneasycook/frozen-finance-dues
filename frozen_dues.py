@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime, date
-from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode, DataReturnMode
 import io
 import requests
 
@@ -15,7 +15,6 @@ RESET_PASSWORD = "c12q7mgh"
 SUPPLIERS_SHEET = "suppliers"
 INVOICES_SHEET = "invoices"
 
-# NEW (extended) schema
 SUPPLIERS_COLS = ["supplier_name", "total_due", "credit_balance"]
 
 INVOICES_COLS = [
@@ -106,10 +105,8 @@ def api_write(sheet_name: str, df: pd.DataFrame):
     if not payload.get("ok"):
         raise RuntimeError(payload.get("error", "API error"))
 
-
 # =========================================================
 # DATE NORMALIZATION (NO .dt used)
-# Always returns "YYYY-MM-DD" or ""
 # =========================================================
 def _excel_serial_to_date(n: float):
     try:
@@ -134,6 +131,7 @@ def _to_yyyy_mm_dd(x) -> str:
         except Exception:
             return ""
 
+    # serial number
     try:
         num = float(x)
         if 20000 < num < 80000:
@@ -164,10 +162,8 @@ def _normalize_dates(series: pd.Series) -> pd.Series:
         return pd.Series([], dtype=str)
     return series.apply(_to_yyyy_mm_dd).astype(str)
 
-
 # =========================================================
 # MIGRATION / NORMALIZATION
-# Supports old headers too
 # =========================================================
 def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     df = df.copy()
@@ -289,17 +285,17 @@ def save_all(suppliers: pd.DataFrame, invoices: pd.DataFrame):
 
 def safe_selected_rows(grid_response) -> list[dict]:
     """
-    st_aggrid sometimes returns selected_rows as:
-    - list[dict]
-    - pandas.DataFrame
-    - dict
-    - None
-    We must NEVER use `or []` with a DataFrame (causes ValueError).
+    Robust extraction for selected rows across st_aggrid versions.
     """
     if not isinstance(grid_response, dict):
         return []
 
-    sr = grid_response.get("selected_rows", None)
+    # Try multiple keys used by different versions
+    sr = None
+    for key in ["selected_rows", "selectedRows", "selectedItems"]:
+        if key in grid_response:
+            sr = grid_response.get(key)
+            break
 
     if sr is None:
         return []
@@ -311,15 +307,39 @@ def safe_selected_rows(grid_response) -> list[dict]:
         except Exception:
             return []
 
-    # single dict
+    # dict
     if isinstance(sr, dict):
         return [sr]
 
-    # list of dicts
+    # list
     if isinstance(sr, list):
         return [x for x in sr if isinstance(x, dict)]
 
     return []
+
+
+def recompute_invoice_row(df: pd.DataFrame, idx: int):
+    df.at[idx, "date"] = _to_yyyy_mm_dd(df.at[idx, "date"])
+    df.at[idx, "payment_date"] = _to_yyyy_mm_dd(df.at[idx, "payment_date"])
+
+    for c in ["invoice_amount", "delivery_cost", "paid_cash", "paid_visa", "paid_total"]:
+        df.at[idx, c] = float(pd.to_numeric(df.at[idx, c], errors="coerce") or 0.0)
+
+    df.at[idx, "total_due"] = round(float(df.at[idx, "invoice_amount"]) + float(df.at[idx, "delivery_cost"]), 2)
+    df.at[idx, "paid_total"] = round(float(df.at[idx, "paid_cash"]) + float(df.at[idx, "paid_visa"]), 2)
+
+    diff = round(float(df.at[idx, "total_due"]) - float(df.at[idx, "paid_total"]), 2)
+    df.at[idx, "remaining"] = round(max(diff, 0.0), 2)
+    df.at[idx, "credit"] = round(max(-diff, 0.0), 2)
+
+    if float(df.at[idx, "credit"]) > 0:
+        df.at[idx, "status"] = "Credit"
+    elif float(df.at[idx, "remaining"]) == 0 and float(df.at[idx, "paid_total"]) > 0:
+        df.at[idx, "status"] = "Paid"
+    elif float(df.at[idx, "paid_total"]) > 0 and float(df.at[idx, "remaining"]) > 0:
+        df.at[idx, "status"] = "Partial"
+    else:
+        df.at[idx, "status"] = "Unpaid"
 
 
 # =========================================================
@@ -520,7 +540,7 @@ elif page == "View Dues":
     AgGrid(suppliers, grid_options, height=450, fit_columns_on_grid_load=True)
 
 # =========================================================
-# View Invoices + Apply Payment
+# View Invoices + Payment Actions
 # =========================================================
 elif page == "View Invoices":
     st.header("All Invoices")
@@ -541,8 +561,6 @@ elif page == "View Invoices":
         )
 
         gb = GridOptionsBuilder.from_dataframe(invoices)
-
-        # Default: no filters
         gb.configure_default_column(editable=False, filterable=False, sortable=True)
 
         # Filters ONLY on: date, branch, supplier, status
@@ -552,7 +570,9 @@ elif page == "View Invoices":
         gb.configure_column("status", filter="agTextColumnFilter", filterable=True)
 
         gb.configure_column("auto_unique_id", hide=True)
-        gb.configure_selection("single", use_checkbox=True)
+
+        # ✅ allow MULTI selection
+        gb.configure_selection("multiple", use_checkbox=True)
 
         grid_options = gb.build()
         grid_options["getRowStyle"] = row_style
@@ -562,8 +582,8 @@ elif page == "View Invoices":
             gridOptions=grid_options,
             height=520,
             fit_columns_on_grid_load=True,
-            update_mode="model_changed",
-            data_return_mode="FILTERED",
+            update_mode=GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.MODEL_CHANGED,
+            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
             allow_unsafe_jscode=True,
         )
 
@@ -574,63 +594,94 @@ elif page == "View Invoices":
             unsafe_allow_html=True,
         )
 
-        # ✅ FIXED selection handling
         selected_rows = safe_selected_rows(grid_response)
 
-        st.subheader("Update / Add Payment (select ONE invoice above)")
-        if not selected_rows:
-            st.info("Select one invoice row (checkbox) to apply a payment.")
-        else:
-            sel = selected_rows[0]
-            inv_id = int(pd.to_numeric(sel.get("auto_unique_id", -1), errors="coerce") or -1)
+        st.subheader("Payment Actions (select one OR more invoices above)")
 
+        if not selected_rows:
+            st.info("Select invoice rows (checkboxes) then choose an action below.")
+        else:
+            sel_ids = sorted([int(pd.to_numeric(r.get("auto_unique_id", -1), errors="coerce") or -1) for r in selected_rows])
             st.markdown(
-                f"<div class='brand-card'><b>Selected Invoice:</b> {sel.get('supplier','')} | {sel.get('branch','')} | ID: {inv_id}</div>",
+                f"<div class='brand-card'><b>Selected Invoices Count:</b> {len(sel_ids)}<br><b>IDs:</b> {', '.join(map(str, sel_ids[:50]))}{' ...' if len(sel_ids)>50 else ''}</div>",
                 unsafe_allow_html=True,
             )
 
-            p1, p2, p3 = st.columns(3)
-            with p1:
-                pay_date2 = st.date_input("Payment Date (update)", datetime.now().date(), key="pay_date_update")
-            with p2:
-                add_cash = st.number_input("Add Cash Payment", min_value=0.0, step=0.01, value=0.0, key="add_cash_update")
-            with p3:
-                add_visa = st.number_input("Add Visa Payment", min_value=0.0, step=0.01, value=0.0, key="add_visa_update")
+            action = st.radio(
+                "Choose action",
+                ["Mark selected as FULLY PAID", "Add SAME payment amount to each selected invoice"],
+                horizontal=False,
+            )
 
-            note2 = st.text_input("Payment Note (e.g. Partial - Cash/Visa)", value="", key="pay_note_update")
+            pay_date = st.date_input("Payment Date", datetime.now().date(), key="bulk_pay_date")
 
-            if st.button("Apply Payment to Selected Invoice"):
+            method = st.selectbox("Payment Method", ["Cash", "Visa", "Cash + Visa"], index=2)
+
+            if method == "Cash":
+                ratio_cash, ratio_visa = 1.0, 0.0
+            elif method == "Visa":
+                ratio_cash, ratio_visa = 0.0, 1.0
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    ratio_cash = st.number_input("Cash %", min_value=0.0, max_value=100.0, value=50.0, step=1.0)
+                with c2:
+                    ratio_visa = st.number_input("Visa %", min_value=0.0, max_value=100.0, value=50.0, step=1.0)
+                s = max(ratio_cash + ratio_visa, 1e-9)
+                ratio_cash, ratio_visa = ratio_cash / s, ratio_visa / s
+
+            note = st.text_input("Payment Note (optional)", value="")
+
+            if action == "Add SAME payment amount to each selected invoice":
+                add_amount = st.number_input("Amount to add to EACH selected invoice", min_value=0.0, step=0.01, value=0.0)
+
+            if st.button("APPLY ACTION"):
                 suppliers, invoices = load_all()
 
-                mask = invoices["auto_unique_id"].astype(int) == inv_id
-                if not mask.any():
-                    st.error("Selected invoice not found (data refreshed). Re-select the invoice.")
-                    st.stop()
+                # map invoice ids -> index
+                invoices["auto_unique_id"] = pd.to_numeric(invoices["auto_unique_id"], errors="coerce").fillna(-1).astype(int)
+                id_to_idx = {int(invoices.at[i, "auto_unique_id"]): i for i in invoices.index}
 
-                i = invoices[mask].index[0]
+                updated = 0
+                for inv_id in sel_ids:
+                    if inv_id not in id_to_idx:
+                        continue
 
-                invoices.at[i, "paid_cash"] = float(pd.to_numeric(invoices.at[i, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
-                invoices.at[i, "paid_visa"] = float(pd.to_numeric(invoices.at[i, "paid_visa"], errors="coerce") or 0.0) + float(add_visa)
-                invoices.at[i, "paid_total"] = float(invoices.at[i, "paid_cash"]) + float(invoices.at[i, "paid_visa"])
+                    i = id_to_idx[inv_id]
 
-                if (float(add_cash) + float(add_visa)) > 0:
-                    invoices.at[i, "payment_date"] = pay_date2.strftime("%Y-%m-%d")
+                    # Ensure numeric
+                    for c in ["paid_cash", "paid_visa", "invoice_amount", "delivery_cost"]:
+                        invoices.at[i, c] = float(pd.to_numeric(invoices.at[i, c], errors="coerce") or 0.0)
 
-                if (note2 or "").strip():
-                    invoices.at[i, "payment_note"] = (note2 or "").strip()
-                else:
-                    parts = []
-                    if float(add_cash) > 0:
-                        parts.append("Cash")
-                    if float(add_visa) > 0:
-                        parts.append("Visa")
-                    if parts:
-                        invoices.at[i, "payment_note"] = " + ".join(parts)
+                    invoices.at[i, "payment_date"] = pay_date.strftime("%Y-%m-%d")
+                    if (note or "").strip():
+                        invoices.at[i, "payment_note"] = (note or "").strip()
+
+                    recompute_invoice_row(invoices, i)
+
+                    if action == "Mark selected as FULLY PAID":
+                        # top-up exactly to reach total_due
+                        total_due = float(invoices.at[i, "total_due"])
+                        paid_total = float(invoices.at[i, "paid_total"])
+                        needed = max(total_due - paid_total, 0.0)
+
+                        invoices.at[i, "paid_cash"] = float(invoices.at[i, "paid_cash"]) + needed * ratio_cash
+                        invoices.at[i, "paid_visa"] = float(invoices.at[i, "paid_visa"]) + needed * ratio_visa
+
+                        recompute_invoice_row(invoices, i)
+
+                    else:
+                        # Add same amount
+                        amt = float(add_amount)
+                        invoices.at[i, "paid_cash"] = float(invoices.at[i, "paid_cash"]) + amt * ratio_cash
+                        invoices.at[i, "paid_visa"] = float(invoices.at[i, "paid_visa"]) + amt * ratio_visa
+                        recompute_invoice_row(invoices, i)
+
+                    updated += 1
 
                 invoices = migrate_invoices(invoices)
                 save_all(suppliers, invoices)
-
-                st.success("Payment applied.")
+                st.success(f"Done. Updated {updated} invoice(s).")
                 st.rerun()
 
 # =========================================================
