@@ -144,7 +144,6 @@ def _to_yyyy_mm_dd(x) -> str:
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return ""
 
-    # already ISO
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         return s
 
@@ -363,6 +362,7 @@ except Exception as e:
 if "supplier_add_msg" not in st.session_state:
     st.session_state["supplier_add_msg"] = None  # ("success"|"error", "text")
 
+
 def add_supplier_callback():
     try:
         suppliers_local, invoices_local = load_all()
@@ -387,12 +387,16 @@ def add_supplier_callback():
     except Exception as ex:
         st.session_state["supplier_add_msg"] = ("error", f"Failed to add supplier: {ex}")
 
+
 if page == "Add Supplier":
     st.header("Add New Supplier")
 
     if st.session_state["supplier_add_msg"]:
         kind, txt = st.session_state["supplier_add_msg"]
-        st.success(txt) if kind == "success" else st.error(txt)
+        if kind == "success":
+            st.success(txt)
+        else:
+            st.error(txt)
         st.session_state["supplier_add_msg"] = None
 
     if "new_supplier_name" not in st.session_state:
@@ -407,7 +411,7 @@ if page == "Add Supplier":
     st.button("Add Supplier", on_click=add_supplier_callback)
 
 # =========================================================
-# Add Invoice (FIXED RESET TO DEFAULT AFTER SUBMIT)
+# Add Invoice (RESET TO DEFAULT AFTER SUBMIT)
 # =========================================================
 elif page == "Add Invoice":
     st.header("Add New Invoice")
@@ -415,7 +419,6 @@ elif page == "Add Invoice":
     if "invoice_add_msg" not in st.session_state:
         st.session_state["invoice_add_msg"] = None  # ("success"|"error", "text")
 
-    # init defaults once
     defaults = {
         "inv_branch": "Select Branch",
         "inv_supplier": "Select Supplier",
@@ -496,7 +499,6 @@ elif page == "Add Invoice":
             invoices_local = migrate_invoices(invoices_local)
             save_all(suppliers_local, invoices_local)
 
-            # RESET ALL FIELDS TO DEFAULTS (THIS IS THE FIX)
             for k, v in defaults.items():
                 st.session_state[k] = v
 
@@ -508,10 +510,12 @@ elif page == "Add Invoice":
     if suppliers.empty:
         st.warning("No suppliers yet. Add supplier first.")
     else:
-        # show message
         if st.session_state["invoice_add_msg"]:
             kind, txt = st.session_state["invoice_add_msg"]
-            st.success(txt) if kind == "success" else st.error(txt)
+            if kind == "success":
+                st.success(txt)
+            else:
+                st.error(txt)
             st.session_state["invoice_add_msg"] = None
 
         c1, c2, c3 = st.columns(3)
@@ -542,7 +546,6 @@ elif page == "Add Invoice":
 
         st.text_input("Payment Note (optional)", key="pay_note")
 
-        # summary card
         total_due = float((st.session_state.get("inv_amount") or 0.0) + (st.session_state.get("del_cost") or 0.0))
         paid_total = float((st.session_state.get("paid_cash") or 0.0) + (st.session_state.get("paid_visa") or 0.0))
         remaining = max(total_due - paid_total, 0.0)
