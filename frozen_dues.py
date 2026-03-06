@@ -111,6 +111,17 @@ def _excel_serial_to_date(n: float):
         return None
 
 
+def _to_storage_date(x) -> str:
+    """Store dates as plain tagged text to stop Google Sheets / timezone coercion."""
+    iso = _to_yyyy_mm_dd(x)
+    return f"TEXTDATE:{iso}" if iso else ""
+
+
+def _strip_date_tag(s: str) -> str:
+    s = str(s or "").strip()
+    return s.split("TEXTDATE:", 1)[1].strip() if s.startswith("TEXTDATE:") else s
+
+
 def _to_yyyy_mm_dd(x) -> str:
     if x is None:
         return ""
@@ -136,7 +147,7 @@ def _to_yyyy_mm_dd(x) -> str:
     except Exception:
         pass
 
-    s = str(x).strip()
+    s = _strip_date_tag(x)
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return ""
 
@@ -183,7 +194,7 @@ def _parse_user_date(x):
     if isinstance(x, date):
         return x
 
-    s = str(x).strip()
+    s = _strip_date_tag(x)
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return None
 
@@ -241,8 +252,8 @@ def migrate_invoices(raw: pd.DataFrame) -> pd.DataFrame:
         ],
     )
 
-    df["date"] = _normalize_dates(df["date"])
-    df["payment_date"] = _normalize_dates(df["payment_date"])
+    df["date"] = _normalize_dates(df["date"]).apply(lambda v: f"TEXTDATE:{v}" if v else "")
+    df["payment_date"] = _normalize_dates(df["payment_date"]).apply(lambda v: f"TEXTDATE:{v}" if v else "")
 
     num_cols = ["invoice_amount", "delivery_cost", "total_due", "paid_total", "paid_cash", "paid_visa", "remaining", "credit"]
     for c in num_cols:
@@ -316,8 +327,10 @@ def recalc_supplier_balances(suppliers: pd.DataFrame, invoices: pd.DataFrame) ->
 
 
 def recompute_invoice_row(df: pd.DataFrame, idx: int):
-    df.at[idx, "date"] = _to_yyyy_mm_dd(df.at[idx, "date"])
-    df.at[idx, "payment_date"] = _to_yyyy_mm_dd(df.at[idx, "payment_date"])
+    date_iso = _to_yyyy_mm_dd(df.at[idx, "date"])
+    pay_iso = _to_yyyy_mm_dd(df.at[idx, "payment_date"])
+    df.at[idx, "date"] = f"TEXTDATE:{date_iso}" if date_iso else ""
+    df.at[idx, "payment_date"] = f"TEXTDATE:{pay_iso}" if pay_iso else ""
 
     for c in ["invoice_amount", "delivery_cost", "paid_cash", "paid_visa", "paid_total"]:
         df.at[idx, c] = float(pd.to_numeric(df.at[idx, c], errors="coerce") or 0.0)
@@ -527,7 +540,7 @@ elif page == "Add Invoice":
                 status = "Unpaid"
 
             new_row = {
-                "date": invoice_date.isoformat(),
+                "date": _to_storage_date(invoice_date),
                 "branch": branch,
                 "supplier": supplier,
                 "invoice_amount": float(invoice_amount),
@@ -536,7 +549,7 @@ elif page == "Add Invoice":
                 "paid_total": float(paid_total),
                 "paid_cash": float(paid_cash),
                 "paid_visa": float(paid_visa),
-                "payment_date": payment_date.isoformat() if paid_total > 0 else "",
+                "payment_date": _to_storage_date(payment_date) if paid_total > 0 else "",
                 "payment_note": note,
                 "remaining": float(remaining),
                 "credit": float(credit),
@@ -778,7 +791,7 @@ elif page == "View Invoices":
             def _apply_payment_to_invoice(df_local: pd.DataFrame, idx: int, add_cash: float, add_bank: float, pdate: date, pnote: str):
                 df_local.at[idx, "paid_cash"] = float(pd.to_numeric(df_local.at[idx, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
                 df_local.at[idx, "paid_visa"] = float(pd.to_numeric(df_local.at[idx, "paid_visa"], errors="coerce") or 0.0) + float(add_bank)
-                df_local.at[idx, "payment_date"] = pdate.isoformat()
+                df_local.at[idx, "payment_date"] = _to_storage_date(pdate)
                 if (pnote or "").strip():
                     df_local.at[idx, "payment_note"] = (pnote or "").strip()
                 recompute_invoice_row(df_local, idx)
