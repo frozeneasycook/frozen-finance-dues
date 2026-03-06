@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 import requests
 
 # =========================================================
@@ -122,6 +123,32 @@ def _strip_date_tag(s: str) -> str:
     return s.split("TEXTDATE:", 1)[1].strip() if s.startswith("TEXTDATE:") else s
 
 
+APP_TZ = ZoneInfo("Africa/Cairo")
+
+
+def _parse_timestamp_string_as_local_date(s: str) -> str:
+    """Handle API-returned timestamps like 2026-03-03T22:00:00.000Z safely.
+    These often represent a sheet date serialized in UTC and should be shown in Egypt local date.
+    """
+    text = str(s or "").strip()
+    if text == "":
+        return ""
+
+    # Common Google Apps Script / JSON timestamp shapes
+    try:
+        if "T" in text:
+            normalized = text.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=APP_TZ)
+            else:
+                dt = dt.astimezone(APP_TZ)
+            return dt.date().strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return ""
+
+
 def _to_yyyy_mm_dd(x) -> str:
     if x is None:
         return ""
@@ -131,7 +158,15 @@ def _to_yyyy_mm_dd(x) -> str:
     except Exception:
         pass
 
-    if isinstance(x, (datetime, date, pd.Timestamp)):
+    if isinstance(x, datetime):
+        try:
+            if x.tzinfo is None:
+                return x.date().strftime("%Y-%m-%d")
+            return x.astimezone(APP_TZ).date().strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    if isinstance(x, (date, pd.Timestamp)):
         try:
             return pd.Timestamp(x).strftime("%Y-%m-%d")
         except Exception:
@@ -151,6 +186,11 @@ def _to_yyyy_mm_dd(x) -> str:
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return ""
 
+    # Google Apps Script / Sheets timestamp returned in UTC
+    local_from_ts = _parse_timestamp_string_as_local_date(s)
+    if local_from_ts:
+        return local_from_ts
+
     # Strict parsing first to avoid month/day flipping
     for fmt in (
         "%Y-%m-%d", "%Y/%m/%d",       # canonical ISO-like
@@ -167,6 +207,8 @@ def _to_yyyy_mm_dd(x) -> str:
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if pd.isna(dt):
             return ""
+        if getattr(dt, "tzinfo", None) is not None:
+            dt = dt.tz_convert(APP_TZ)
         return pd.Timestamp(dt).strftime("%Y-%m-%d")
     except Exception:
         return ""
@@ -188,8 +230,18 @@ def _parse_user_date(x):
         pass
 
     if isinstance(x, pd.Timestamp):
+        try:
+            if x.tzinfo is not None:
+                return x.tz_convert(APP_TZ).date()
+        except Exception:
+            pass
         return x.date()
     if isinstance(x, datetime):
+        try:
+            if x.tzinfo is not None:
+                return x.astimezone(APP_TZ).date()
+        except Exception:
+            pass
         return x.date()
     if isinstance(x, date):
         return x
@@ -197,6 +249,10 @@ def _parse_user_date(x):
     s = _strip_date_tag(x)
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return None
+
+    local_from_ts = _parse_timestamp_string_as_local_date(s)
+    if local_from_ts:
+        return datetime.strptime(local_from_ts, "%Y-%m-%d").date()
 
     for fmt in (
         "%Y-%m-%d", "%Y/%m/%d",
@@ -212,6 +268,8 @@ def _parse_user_date(x):
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if pd.isna(dt):
             return None
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.tz_convert(APP_TZ).date()
         return pd.Timestamp(dt).date()
     except Exception:
         return None
