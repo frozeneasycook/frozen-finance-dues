@@ -140,11 +140,20 @@ def _to_yyyy_mm_dd(x) -> str:
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return ""
 
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        return s
+    # Strict parsing first to avoid month/day flipping
+    for fmt in (
+        "%Y-%m-%d", "%Y/%m/%d",       # canonical ISO-like
+        "%d-%m-%Y", "%d/%m/%Y",       # user-facing day-first
+        "%m-%d-%Y", "%m/%d/%Y",       # month-first legacy
+    ):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
+    # Fallback: if separator is '-' or '/', prefer day-first for ambiguous text
     try:
-        dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if pd.isna(dt):
             return ""
         return pd.Timestamp(dt).strftime("%Y-%m-%d")
@@ -178,7 +187,11 @@ def _parse_user_date(x):
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return None
 
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y"):
+    for fmt in (
+        "%Y-%m-%d", "%Y/%m/%d",
+        "%d-%m-%Y", "%d/%m/%Y",
+        "%m-%d-%Y", "%m/%d/%Y",
+    ):
         try:
             return datetime.strptime(s, fmt).date()
         except Exception:
@@ -514,7 +527,7 @@ elif page == "Add Invoice":
                 status = "Unpaid"
 
             new_row = {
-                "date": invoice_date.strftime("%d-%m-%Y"),
+                "date": invoice_date.isoformat(),
                 "branch": branch,
                 "supplier": supplier,
                 "invoice_amount": float(invoice_amount),
@@ -523,7 +536,7 @@ elif page == "Add Invoice":
                 "paid_total": float(paid_total),
                 "paid_cash": float(paid_cash),
                 "paid_visa": float(paid_visa),
-                "payment_date": payment_date.strftime("%d-%m-%Y") if paid_total > 0 else "",
+                "payment_date": payment_date.isoformat() if paid_total > 0 else "",
                 "payment_note": note,
                 "remaining": float(remaining),
                 "credit": float(credit),
@@ -765,7 +778,7 @@ elif page == "View Invoices":
             def _apply_payment_to_invoice(df_local: pd.DataFrame, idx: int, add_cash: float, add_bank: float, pdate: date, pnote: str):
                 df_local.at[idx, "paid_cash"] = float(pd.to_numeric(df_local.at[idx, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
                 df_local.at[idx, "paid_visa"] = float(pd.to_numeric(df_local.at[idx, "paid_visa"], errors="coerce") or 0.0) + float(add_bank)
-                df_local.at[idx, "payment_date"] = pdate.strftime("%d-%m-%Y")
+                df_local.at[idx, "payment_date"] = pdate.isoformat()
                 if (pnote or "").strip():
                     df_local.at[idx, "payment_note"] = (pnote or "").strip()
                 recompute_invoice_row(df_local, idx)
