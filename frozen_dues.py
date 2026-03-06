@@ -24,7 +24,7 @@ INVOICES_COLS = [
     "total_due",
     "paid_total",
     "paid_cash",
-    "paid_visa",          # stored as paid_visa, UI shows Bank
+    "paid_visa",          # keep stored as "paid_visa" but UI calls it "Bank"
     "payment_date",
     "payment_note",
     "remaining",
@@ -52,6 +52,10 @@ BRAND_WHITE = "#FFFFFF"
 
 # =========================================================
 # API (Google Apps Script Web App)
+# Streamlit Secrets:
+# [api]
+# url   = "https://script.google.com/macros/s/.../exec"
+# token = "FrozenFinance2026Key"
 # =========================================================
 def _get_api_conf():
     if "api" not in st.secrets:
@@ -97,7 +101,7 @@ def api_write(sheet_name: str, df: pd.DataFrame):
 
 
 # =========================================================
-# DATE HELPERS
+# DATE NORMALIZATION (NO .dt)
 # =========================================================
 def _excel_serial_to_date(n: float):
     try:
@@ -110,7 +114,6 @@ def _excel_serial_to_date(n: float):
 def _to_yyyy_mm_dd(x) -> str:
     if x is None:
         return ""
-
     try:
         if pd.isna(x):
             return ""
@@ -137,30 +140,11 @@ def _to_yyyy_mm_dd(x) -> str:
     if s == "" or s.lower() in ("none", "nan", "nat"):
         return ""
 
-    # exact ISO date
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         return s
 
-    # exact ISO datetime or timestamps returned by APIs / Google Sheets
     try:
-        if "T" in s or ":" in s:
-            dt = pd.to_datetime(s, errors="coerce", utc=False)
-            if not pd.isna(dt):
-                return pd.Timestamp(dt).strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    # slash-based dates: prioritize day-first for Egyptian usage
-    try:
-        if "/" in s:
-            dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-            if not pd.isna(dt):
-                return pd.Timestamp(dt).strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    try:
-        dt = pd.to_datetime(s, errors="coerce")
+        dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
         if pd.isna(dt):
             return ""
         return pd.Timestamp(dt).strftime("%Y-%m-%d")
@@ -174,14 +158,44 @@ def _normalize_dates(series: pd.Series) -> pd.Series:
     return series.apply(_to_yyyy_mm_dd).astype(str)
 
 
-def _display_date(x) -> str:
-    s = _to_yyyy_mm_dd(x)
-    if not s:
-        return ""
+def _parse_user_date(x):
+    if x is None:
+        return None
     try:
-        return pd.Timestamp(s).strftime("%d-%m-%Y")
+        if pd.isna(x):
+            return None
     except Exception:
-        return s
+        pass
+
+    if isinstance(x, pd.Timestamp):
+        return x.date()
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+
+    s = str(x).strip()
+    if s == "" or s.lower() in ("none", "nan", "nat"):
+        return None
+
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+
+    try:
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        if pd.isna(dt):
+            return None
+        return pd.Timestamp(dt).date()
+    except Exception:
+        return None
+
+
+def _display_dd_mm_yyyy(x) -> str:
+    d = _parse_user_date(x)
+    return d.strftime("%d-%m-%Y") if d else ""
 
 
 # =========================================================
@@ -271,7 +285,7 @@ def recalc_supplier_balances(suppliers: pd.DataFrame, invoices: pd.DataFrame) ->
     missing = sorted(list(inv_supps - sup_supps))
     if missing:
         suppliers = pd.concat(
-            [suppliers, pd.DataFrame({"supplier_name": missing, "total_due": [0.0] * len(missing), "credit_balance": [0.0] * len(missing)})],
+            [suppliers, pd.DataFrame({"supplier_name": missing, "total_due": [0.0]*len(missing), "credit_balance": [0.0]*len(missing)})],
             ignore_index=True,
         )
 
@@ -333,7 +347,7 @@ def save_all(suppliers: pd.DataFrame, invoices: pd.DataFrame):
     suppliers = recalc_supplier_balances(suppliers, invoices)
     api_write(INVOICES_SHEET, ensure_columns(invoices, INVOICES_COLS))
     api_write(SUPPLIERS_SHEET, ensure_columns(suppliers, SUPPLIERS_COLS))
-    _cached_load_all.clear()
+    _cached_load_all.clear()  # refresh cache after write
 
 
 # =========================================================
@@ -379,18 +393,18 @@ page = st.sidebar.radio(
     ["Add Supplier", "Add Invoice", "View Dues", "View Invoices", "Reset (Admin)"],
 )
 
+# Load data
 try:
     suppliers, invoices = load_all()
 except Exception as e:
     st.error(f"Failed to load data from Google Sheet API: {e}")
     st.stop()
 
-
 # =========================================================
 # Add Supplier
 # =========================================================
 if "supplier_add_msg" not in st.session_state:
-    st.session_state["supplier_add_msg"] = None
+    st.session_state["supplier_add_msg"] = None  # ("success"|"error", "text")
 
 
 def add_supplier_callback():
@@ -431,7 +445,6 @@ if page == "Add Supplier":
 
     st.text_input("Supplier Name", key="new_supplier_name", placeholder="please add new supplier")
     st.button("Add Supplier", on_click=add_supplier_callback)
-
 
 # =========================================================
 # Add Invoice
@@ -501,7 +514,7 @@ elif page == "Add Invoice":
                 status = "Unpaid"
 
             new_row = {
-                "date": _to_yyyy_mm_dd(invoice_date),
+                "date": invoice_date.strftime("%d-%m-%Y"),
                 "branch": branch,
                 "supplier": supplier,
                 "invoice_amount": float(invoice_amount),
@@ -510,7 +523,7 @@ elif page == "Add Invoice":
                 "paid_total": float(paid_total),
                 "paid_cash": float(paid_cash),
                 "paid_visa": float(paid_visa),
-                "payment_date": _to_yyyy_mm_dd(payment_date) if paid_total > 0 else "",
+                "payment_date": payment_date.strftime("%d-%m-%Y") if paid_total > 0 else "",
                 "payment_note": note,
                 "remaining": float(remaining),
                 "credit": float(credit),
@@ -546,7 +559,7 @@ elif page == "Add Invoice":
             supplier_options = ["Select Supplier"] + suppliers["supplier_name"].astype(str).tolist()
             st.selectbox("Supplier", supplier_options, key="inv_supplier")
         with c3:
-            st.date_input("Invoice Date", value=st.session_state["inv_date"], key="inv_date", format="DD/MM/YYYY")
+            st.date_input("Invoice Date", value=st.session_state["inv_date"], key="inv_date")
 
         st.subheader("Invoice Amounts")
         a1, a2 = st.columns(2)
@@ -558,7 +571,7 @@ elif page == "Add Invoice":
         st.subheader("Payment Details (0 / partial / full / overpaid)")
         p1, p2, p3 = st.columns(3)
         with p1:
-            st.date_input("Payment Date", value=st.session_state["pay_date"], key="pay_date", format="DD/MM/YYYY")
+            st.date_input("Payment Date", value=st.session_state["pay_date"], key="pay_date")
         with p2:
             st.number_input("Paid Cash", min_value=0.0, step=0.01, key="paid_cash")
         with p3:
@@ -595,9 +608,8 @@ elif page == "Add Invoice":
 
         st.button("Submit Invoice", on_click=add_invoice_callback)
 
-
 # =========================================================
-# View Dues
+# View Dues (MOBILE FRIENDLY)
 # =========================================================
 elif page == "View Dues":
     st.header("Supplier Dues")
@@ -626,9 +638,8 @@ elif page == "View Dues":
         },
     )
 
-
 # =========================================================
-# View Invoices
+# View Invoices (MOBILE FRIENDLY, FAST)
 # =========================================================
 elif page == "View Invoices":
     st.header("All Invoices")
@@ -636,6 +647,7 @@ elif page == "View Invoices":
     if invoices.empty:
         st.info("No invoices yet.")
     else:
+        # ---------- Filters (native) ----------
         f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 1.2])
         with f1:
             branch_filter = st.selectbox("Branch", ["All"] + branches, index=0)
@@ -650,13 +662,14 @@ elif page == "View Invoices":
         if date_mode == "Between":
             d1, d2 = st.columns(2)
             with d1:
-                start_d = st.date_input("From", value=date.today(), format="DD/MM/YYYY")
+                start_d = st.date_input("From", value=date.today())
             with d2:
-                end_d = st.date_input("To", value=date.today(), format="DD/MM/YYYY")
+                end_d = st.date_input("To", value=date.today())
 
         df = invoices.copy()
-        df["date"] = df["date"].apply(_to_yyyy_mm_dd)
-        df["payment_date"] = df["payment_date"].apply(_to_yyyy_mm_dd)
+        df["date"] = df["date"].astype(str)
+        df["payment_date"] = df["payment_date"].astype(str)
+        df["date_sort"] = df["date"].apply(_parse_user_date)
 
         if branch_filter != "All":
             df = df[df["branch"] == branch_filter]
@@ -666,9 +679,8 @@ elif page == "View Invoices":
             df = df[df["status"] == status_filter]
 
         if date_mode == "Between" and start_d and end_d:
-            s = start_d.strftime("%Y-%m-%d")
-            e = end_d.strftime("%Y-%m-%d")
-            df = df[(df["date"] >= s) & (df["date"] <= e)]
+            df = df[df["date_sort"].notna()]
+            df = df[(df["date_sort"] >= start_d) & (df["date_sort"] <= end_d)]
 
         filtered_remaining_sum = float(pd.to_numeric(df.get("remaining", 0), errors="coerce").fillna(0).sum())
         st.markdown(
@@ -676,11 +688,15 @@ elif page == "View Invoices":
             unsafe_allow_html=True,
         )
 
+        # ---------- Selection table (checkbox) ----------
         view = df.copy()
-        view["date"] = view["date"].apply(_display_date)
-        view["payment_date"] = view["payment_date"].apply(_display_date)
+        view["date"] = view["date"].apply(_display_dd_mm_yyyy)
+        view["payment_date"] = view["payment_date"].apply(_display_dd_mm_yyyy)
+        if "date_sort" in view.columns:
+            view = view.drop(columns=["date_sort"])
         view.insert(0, "Select", False)
 
+        # Prevent edits except checkbox: we will ignore any other edits anyway by disabling columns
         disabled_cols = [c for c in view.columns if c != "Select"]
 
         edited = st.data_editor(
@@ -714,20 +730,16 @@ elif page == "View Invoices":
         else:
             selected_ids = sorted(pd.to_numeric(selected["auto_unique_id"], errors="coerce").fillna(-1).astype(int).tolist())
             st.markdown(
-                f"<div class='brand-card'><b>Selected:</b> {len(selected_ids)} invoice(s)<br><b>IDs:</b> {', '.join(map(str, selected_ids[:120]))}{' ...' if len(selected_ids) > 120 else ''}</div>",
+                f"<div class='brand-card'><b>Selected:</b> {len(selected_ids)} invoice(s)<br><b>IDs:</b> {', '.join(map(str, selected_ids[:120]))}{' ...' if len(selected_ids)>120 else ''}</div>",
                 unsafe_allow_html=True,
             )
 
             st.subheader("Actions")
             action = st.radio("Choose action", ["Full Pay", "Partial Pay", "Delete Invoice(s)"], horizontal=True)
 
-            pay_date = st.date_input("Payment Date", datetime.now().date(), key="mobile_pay_date", format="DD/MM/YYYY")
+            pay_date = st.date_input("Payment Date", datetime.now().date(), key="mobile_pay_date")
             method = st.selectbox("Payment Method", ["Bank", "Cash", "Cash + Bank"], index=0)
             note = st.text_input("Payment Note (optional)", value="")
-
-            selected_live = invoices[invoices["auto_unique_id"].isin(selected_ids)].copy()
-            selected_remaining = float(pd.to_numeric(selected_live["remaining"], errors="coerce").fillna(0).sum())
-            st.caption(f"Selected remaining total: {selected_remaining:,.2f}")
 
             cash_amt = 0.0
             bank_amt = 0.0
@@ -739,25 +751,12 @@ elif page == "View Invoices":
                 else:
                     c1, c2 = st.columns(2)
                     with c1:
-                        cash_amt = st.number_input("Cash Amount", min_value=0.0, step=0.01, value=0.0, key="partial_cash_amt")
+                        cash_amt = st.number_input("Cash Amount", min_value=0.0, step=0.01, value=0.0)
                     with c2:
-                        bank_amt = st.number_input("Bank Amount", min_value=0.0, step=0.01, value=0.0, key="partial_bank_amt")
+                        bank_amt = st.number_input("Bank Amount", min_value=0.0, step=0.01, value=0.0)
                     total_amt = float(cash_amt + bank_amt)
-
-            elif action == "Full Pay":
-                if method == "Cash + Bank":
-                    cash_amt = st.number_input(
-                        "Cash Amount",
-                        min_value=0.0,
-                        step=0.01,
-                        value=0.0,
-                        help="Bank amount will be calculated automatically as the remaining balance.",
-                        key="full_cash_amt",
-                    )
-                    if cash_amt > selected_remaining:
-                        st.error("Cash amount cannot be more than total selected remaining.")
-                    bank_amt = max(selected_remaining - cash_amt, 0.0)
-                    st.info(f"Bank Amount (auto): {bank_amt:,.2f}")
+            elif action == "Full Pay" and method == "Cash + Bank":
+                cash_amt = st.number_input("Cash Amount", min_value=0.0, step=0.01, value=0.0)
 
             del_pw = ""
             if action == "Delete Invoice(s)":
@@ -766,7 +765,7 @@ elif page == "View Invoices":
             def _apply_payment_to_invoice(df_local: pd.DataFrame, idx: int, add_cash: float, add_bank: float, pdate: date, pnote: str):
                 df_local.at[idx, "paid_cash"] = float(pd.to_numeric(df_local.at[idx, "paid_cash"], errors="coerce") or 0.0) + float(add_cash)
                 df_local.at[idx, "paid_visa"] = float(pd.to_numeric(df_local.at[idx, "paid_visa"], errors="coerce") or 0.0) + float(add_bank)
-                df_local.at[idx, "payment_date"] = _to_yyyy_mm_dd(pdate)
+                df_local.at[idx, "payment_date"] = pdate.strftime("%d-%m-%Y")
                 if (pnote or "").strip():
                     df_local.at[idx, "payment_note"] = (pnote or "").strip()
                 recompute_invoice_row(df_local, idx)
@@ -788,11 +787,8 @@ elif page == "View Invoices":
                     st.success(f"Deleted {before - len(invoices_local)} invoice(s).")
                     st.rerun()
 
+                # PAYMENTS
                 updated = 0
-                full_split_remaining_total = selected_remaining
-                full_split_cash_left = float(cash_amt)
-                full_split_bank_left = float(bank_amt)
-
                 for inv_id in selected_ids:
                     if inv_id not in id_to_idx:
                         continue
@@ -810,14 +806,14 @@ elif page == "View Invoices":
                         elif method == "Cash":
                             add_cash, add_bank = float(needed), 0.0
                         else:
-                            if abs((full_split_cash_left + full_split_bank_left) - full_split_remaining_total) > 0.01:
-                                st.error("For Full Pay with Cash + Bank, the split must equal the total selected remaining.")
+                            if float(cash_amt) < 0:
+                                st.error("Cash amount cannot be negative.")
                                 st.stop()
-
-                            add_cash = min(full_split_cash_left, needed)
-                            add_bank = needed - add_cash
-                            full_split_cash_left = round(full_split_cash_left - add_cash, 2)
-                            full_split_bank_left = round(full_split_bank_left - add_bank, 2)
+                            if float(cash_amt) - float(needed) > 0.01:
+                                st.error(f"Cash amount cannot exceed remaining for FULL PAY. Invoice {inv_id} remaining = {needed:,.2f}")
+                                st.stop()
+                            add_cash = float(cash_amt)
+                            add_bank = round(float(needed) - float(cash_amt), 2)
 
                         _apply_payment_to_invoice(invoices_local, i, add_cash, add_bank, pay_date, note)
                         updated += 1
@@ -840,7 +836,6 @@ elif page == "View Invoices":
                 save_all(suppliers_local, invoices_local)
                 st.success(f"Done. Updated {updated} invoice(s).")
                 st.rerun()
-
 
 # =========================================================
 # Reset (Admin)
